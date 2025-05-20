@@ -18,15 +18,11 @@ from app.core.models import (
     ValidationResult,
     DataQualityStatus
 )
-from app.core.db_manager import DBManager
+from app.core.in_memory_job_store import job_store
 from app.agents.workflow import DataEnhancementWorkflow
 from app.config.settings import get_llm
 
 router = APIRouter(prefix="/api/v1", tags=["data-enhancement"])
-
-# In-memory cache for current jobs for fast access
-# The persistent storage is in PostgreSQL
-enhancement_jobs: Dict[str, Dict[str, Any]] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +35,6 @@ def get_workflow() -> DataEnhancementWorkflow:
     """
     llm = get_llm()
     return DataEnhancementWorkflow(llm)
-
-def get_db():
-    """
-    Get the database manager.
-    
-    Returns:
-        DBManager: The database manager
-    """
-    return DBManager()
 
 @router.post("/validate", response_model=Dict[str, Any])
 async def validate_data_element(data_element: DataElement):
@@ -107,7 +94,6 @@ async def validate_data_element(data_element: DataElement):
 async def enhance_data_element(
     request: EnhancementRequest,
     background_tasks: BackgroundTasks,
-    db: DBManager = Depends(get_db)
 ):
     """
     Enhance a data element to meet ISO/IEC 11179 standards.
@@ -116,7 +102,6 @@ async def enhance_data_element(
     Args:
         request: Enhancement request with data element
         background_tasks: FastAPI background tasks
-        db: Database manager
         
     Returns:
         EnhancementResponse with request ID and status
@@ -125,49 +110,20 @@ async def enhance_data_element(
     request_id = request.data_element.id
     logger.info(f"Enhancement request received for data element: {request_id}")
     
-    # Check if this ID is already being processed in memory
-    if request_id in enhancement_jobs:
-        logger.info(f"Enhancement job already exists in memory for ID: {request_id}")
-        job = enhancement_jobs[request_id]
-        
-        # If already completed or failed, return the result
-        if job["status"] in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
-            return EnhancementResponse(
-                request_id=request_id,
-                status=job["status"],
-                enhanced_data=job.get("result"),  # Use get() to avoid KeyError
-                error_message=job.get("error")
-            )
-        
-        # Otherwise, return the current status
-        return EnhancementResponse(
-            request_id=request_id,
-            status=job["status"],
-            enhanced_data=None,
-            error_message=None
-        )
+    # Get job from in-memory store
+    job_data = job_store.get_job(request_id)
     
-    # Check if job exists in the database
-    db_job = db.get_job(request_id)
-    if db_job is not None:
-        # Job exists in database
-        status = EnhancementStatus(db_job["status"])
-        
-        # Load job data from database to memory for faster access
-        enhancement_jobs[request_id] = {
-            "status": status,
-            "request": db_job["data"].get("request", {}),
-            "result": db_job["data"].get("result"),
-            "error": db_job["data"].get("error")
-        }
+    if job_data:
+        # Job exists, get status
+        status = EnhancementStatus(job_data["status"])
         
         # If already completed or failed, return the result
         if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
             return EnhancementResponse(
                 request_id=request_id,
                 status=status,
-                enhanced_data=enhancement_jobs[request_id].get("result"),
-                error_message=enhancement_jobs[request_id].get("error")
+                enhanced_data=job_data["data"].get("result"),
+                error_message=job_data["data"].get("error")
             )
         
         # Otherwise, return the current status
@@ -178,16 +134,8 @@ async def enhance_data_element(
             error_message=None
         )
     
-    # Initialize job status in memory - important to set all fields
-    enhancement_jobs[request_id] = {
-        "status": EnhancementStatus.PENDING,
-        "request": request.dict(),
-        "result": None,
-        "error": None
-    }
-    
-    # Store job in database
-    db.store_job(
+    # Initialize job in memory
+    job_store.store_job(
         job_id=request_id,
         job_type="enhancement",
         status=EnhancementStatus.PENDING.value,
@@ -214,61 +162,36 @@ async def enhance_data_element(
     )
 
 @router.get("/enhance/{request_id}", response_model=EnhancementResponse)
-async def get_enhancement_status(request_id: str, db: DBManager = Depends(get_db)):
+async def get_enhancement_status(request_id: str):
     """
     Get the status of an enhancement job.
     
     Args:
         request_id: ID of the enhancement job
-        db: Database manager
         
     Returns:
         EnhancementResponse with current status and results if available
     """
-    # First check in-memory cache for faster access
-    if request_id in enhancement_jobs:
-        job = enhancement_jobs[request_id]
-        
-        logger.debug(f"Enhancement job found in memory: {request_id}, status: {job['status']}")
-        logger.debug(f"Job data: {job}")
-        
-        return EnhancementResponse(
-            request_id=request_id,
-            status=job["status"],
-            enhanced_data=job.get("result"),
-            error_message=job.get("error")
-        )
+    # Get job from in-memory store
+    job_data = job_store.get_job(request_id)
     
-    # If not in memory, check the database
-    db_job = db.get_job(request_id)
-    if db_job is None:
+    if not job_data:
         raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
     
     # Convert status string to enum
-    status = EnhancementStatus(db_job["status"])
-    
-    # Load into memory cache for future requests
-    enhancement_jobs[request_id] = {
-        "status": status,
-        "request": db_job["data"].get("request", {}),
-        "result": db_job["data"].get("result"),
-        "error": db_job["data"].get("error")
-    }
-    
-    logger.debug(f"Enhancement job loaded from database: {request_id}, status: {status}")
+    status = EnhancementStatus(job_data["status"])
     
     return EnhancementResponse(
         request_id=request_id,
         status=status,
-        enhanced_data=enhancement_jobs[request_id].get("result"),
-        error_message=enhancement_jobs[request_id].get("error")
+        enhanced_data=job_data["data"].get("result"),
+        error_message=job_data["data"].get("error")
     )
 
 @router.post("/enhance/batch", response_model=List[str])
 async def batch_enhance_data_elements(
     requests: List[EnhancementRequest],
     background_tasks: BackgroundTasks,
-    db: DBManager = Depends(get_db)
 ):
     """
     Enhance multiple data elements in batch mode.
@@ -277,7 +200,6 @@ async def batch_enhance_data_elements(
     Args:
         requests: List of enhancement requests
         background_tasks: FastAPI background tasks
-        db: Database manager
         
     Returns:
         List of request IDs
@@ -288,37 +210,23 @@ async def batch_enhance_data_elements(
         request_id = request.data_element.id
         request_ids.append(request_id)
         
-        # Skip if already processing in memory
-        if request_id in enhancement_jobs:
-            if enhancement_jobs[request_id]["status"] not in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
-                continue
+        # Get job from in-memory store
+        job_data = job_store.get_job(request_id)
         
-        # Check if job exists in database
-        db_job = db.get_job(request_id)
-        if db_job is not None:
-            status = EnhancementStatus(db_job["status"])
+        if job_data:
+            # Job exists, get status
+            status = EnhancementStatus(job_data["status"])
             
             # Skip if already completed or failed
             if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
-                # Load into memory cache
-                enhancement_jobs[request_id] = {
-                    "status": status,
-                    "request": db_job["data"].get("request", {}),
-                    "result": db_job["data"].get("result"),
-                    "error": db_job["data"].get("error")
-                }
+                continue
+            
+            # Skip if already in progress
+            if status == EnhancementStatus.IN_PROGRESS:
                 continue
         
-        # Initialize job status with all required fields
-        enhancement_jobs[request_id] = {
-            "status": EnhancementStatus.PENDING,
-            "request": request.dict(),
-            "result": None,
-            "error": None
-        }
-        
-        # Store job in database
-        db.store_job(
+        # Initialize job in memory
+        job_store.store_job(
             job_id=request_id,
             job_type="enhancement",
             status=EnhancementStatus.PENDING.value,
@@ -340,40 +248,28 @@ async def batch_enhance_data_elements(
     return request_ids
 
 @router.delete("/enhance/{request_id}", response_model=Dict[str, Any])
-async def delete_enhancement_job(request_id: str, db: DBManager = Depends(get_db)):
+async def delete_enhancement_job(request_id: str):
     """
     Delete an enhancement job from the system.
     
     Args:
         request_id: ID of the job to delete
-        db: Database manager
         
     Returns:
         Dict with deletion message
     """
-    # Check if job exists
-    if request_id not in enhancement_jobs and db.get_job(request_id) is None:
+    # Get job from in-memory store
+    job_data = job_store.get_job(request_id)
+    
+    if not job_data:
         raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
     
-    # Get status from memory or database
-    status = None
-    if request_id in enhancement_jobs:
-        status = enhancement_jobs[request_id]["status"]
-    else:
-        db_job = db.get_job(request_id)
-        if db_job:
-            status = EnhancementStatus(db_job["status"])
-    
     # Don't allow deleting running jobs
-    if status == EnhancementStatus.IN_PROGRESS:
+    if job_data["status"] == EnhancementStatus.IN_PROGRESS.value:
         raise HTTPException(status_code=400, detail=f"Cannot delete a job that is currently in progress")
     
-    # Delete from memory
-    if request_id in enhancement_jobs:
-        del enhancement_jobs[request_id]
-    
-    # Delete from database
-    db.delete_job(request_id)
+    # Delete job
+    job_store.delete_job(request_id)
     
     return {"message": f"Enhancement job {request_id} deleted successfully"}
 
@@ -388,37 +284,29 @@ async def run_enhancement_job(request_id: str, data_element: DataElement, max_it
     """
     logger.info(f"Starting enhancement job for {request_id}")
     workflow = get_workflow()
-    db = DBManager()
     
     try:
         # Update job status to in progress
-        enhancement_jobs[request_id]["status"] = EnhancementStatus.IN_PROGRESS
-        
-        # Update database status
-        db.store_job(
+        job_store.store_job(
             job_id=request_id,
             job_type="enhancement",
             status=EnhancementStatus.IN_PROGRESS.value,
-            data=enhancement_jobs[request_id]
+            data=job_store.get_job(request_id)["data"]
         )
         
         # Run the workflow
         result = await workflow.run(data_element, max_iterations)
         
-        # Update job status to completed in memory
-        enhancement_jobs[request_id]["status"] = EnhancementStatus.COMPLETED
-        enhancement_jobs[request_id]["result"] = result
-        enhancement_jobs[request_id]["error"] = None
+        # Get current job data
+        job_data = job_store.get_job(request_id)["data"]
         
-        logger.info(f"Job result: {result}")
-        
-        # Update database with result - important to convert result to dict
-        db.store_job(
+        # Update job status to completed
+        job_store.store_job(
             job_id=request_id,
             job_type="enhancement",
             status=EnhancementStatus.COMPLETED.value,
             data={
-                "request": enhancement_jobs[request_id]["request"],
+                "request": job_data["request"],
                 "result": result.dict(),
                 "error": None
             }
@@ -427,24 +315,20 @@ async def run_enhancement_job(request_id: str, data_element: DataElement, max_it
         logger.info(f"Enhancement job completed for {request_id}")
         
     except Exception as e:
-        # Update job status to failed in memory
+        # Update job status to failed
         logger.error(f"Enhancement job failed for {request_id}: {str(e)}")
         
-        if request_id in enhancement_jobs:
-            enhancement_jobs[request_id]["status"] = EnhancementStatus.FAILED
-            enhancement_jobs[request_id]["error"] = str(e)
-            enhancement_jobs[request_id]["result"] = None
+        # Get current job data
+        job_data = job_store.get_job(request_id)["data"]
         
-            # Update database with error
-            db.store_job(
-                job_id=request_id,
-                job_type="enhancement",
-                status=EnhancementStatus.FAILED.value,
-                data={
-                    "request": enhancement_jobs[request_id]["request"],
-                    "result": None,
-                    "error": str(e)
-                }
-            )
-        else:
-            logger.error(f"Job {request_id} not found in memory after failure")
+        # Update job status to failed
+        job_store.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.FAILED.value,
+            data={
+                "request": job_data["request"],
+                "result": None,
+                "error": str(e)
+            }
+        )

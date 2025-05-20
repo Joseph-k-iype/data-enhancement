@@ -22,7 +22,7 @@ from app.api.routes.enhancement import router as enhancement_router
 from app.api.routes.settings import router as settings_router
 from app.config.environment import get_os_env, str_to_bool
 from app.core.system_monitor import start_monitoring, stop_monitoring
-from app.core.db_manager import DBManager
+from app.core.in_memory_job_store import job_store
 from app.utils.auth_helper import initialize_token_caching
 
 # Set up logging
@@ -77,15 +77,9 @@ def create_application(
     logger.info(f"Proxy enabled: {env.get('PROXY_ENABLED')}")
     logger.info(f"Model name: {env.get('MODEL_NAME', 'gpt-4o-mini')}")
 
-    # Initialize PostgreSQL DBManager (for jobs, non-vector data)
-    db_manager = DBManager()
-    db_health = db_manager.health_check()
-    if db_health["status"] == "healthy":
-        pg_version_info = db_health.get('version', 'unknown version')
-        pg_version = pg_version_info.split(' ')[1] if len(pg_version_info.split(' ')) > 1 else pg_version_info
-        logger.info(f"PostgreSQL connection successful: Version {pg_version}")
-    else:
-        logger.error(f"PostgreSQL connection failed: {db_health.get('error', 'Unknown error')}")
+    # Check in-memory job store health
+    store_health = job_store.health_check()
+    logger.info(f"In-memory job store initialized: {store_health}")
     
     app = FastAPI(
         title="Data Element Enhancement API",
@@ -123,14 +117,13 @@ def create_application(
         logger.info("Application shutting down...")
         if monitoring_interval > 0:
             stop_monitoring()
-        # Add any other cleanup tasks here (e.g., closing DB connections if not pooled)
         logger.info("Shutdown complete.")
 
     @app.get("/health", tags=["System"])
     async def health_check_endpoint():
         """Provides a health check for the API and its dependencies."""
         current_env = get_os_env() # Get current state of env vars
-        db_status = db_manager.health_check()
+        store_status = job_store.health_check()
 
         # Add token caching status to health check
         token_caching_status = {
@@ -145,7 +138,7 @@ def create_application(
             "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
             "azure_endpoint": current_env.get("AZURE_ENDPOINT", "Not Set"),
             "active_model": current_env.get("MODEL_NAME", "gpt-4o-mini"),
-            "postgresql_status": db_status.get("status", "unknown"),
+            "job_store_status": store_status,
             "token_caching": token_caching_status
         }
 

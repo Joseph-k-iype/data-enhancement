@@ -103,46 +103,6 @@ class OSEnv:
             self.token = None
         
         self.credential = self._get_credential()
-        
-        # Set PostgreSQL environment variables if not already set
-        self._set_postgres_defaults()
-        
-    def _set_postgres_defaults(self):
-        """Set default PostgreSQL environment variables if not already set."""
-        # Default PostgreSQL configuration
-        postgres_defaults = {
-            "PG_HOST": self.get("PG_HOST", "localhost"),
-            "PG_PORT": self.get("PG_PORT", "5432"),
-            "PG_USER": self.get("PG_USER", "postgres"),
-            "PG_PASSWORD": self.get("PG_PASSWORD", "postgres"),
-            "PG_DB": self.get("PG_DB", "metadata_db")
-        }
-        
-        # Set defaults if not already set
-        for key, value in postgres_defaults.items():
-            if not self.get(key):
-                self.set(key, value)
-                
-        # Log PostgreSQL configuration (without password)
-        logger.info(f"PostgreSQL configuration: host={self.get('PG_HOST')}, port={self.get('PG_PORT')}, db={self.get('PG_DB')}, user={self.get('PG_USER')}")
-        
-        # Vector database configuration
-        vector_db_type = self.get("VECTOR_DB_TYPE", "chroma").lower()  # Default to chroma
-        logger.info(f"Vector database type: {vector_db_type}")
-        
-        if vector_db_type == "chroma":
-            # Set defaults for ChromaDB
-            chroma_defaults = {
-                "CHROMA_PERSIST_DIR": self.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-                "CHROMA_COLLECTION": self.get("CHROMA_COLLECTION", "business_terms")
-            }
-            
-            # Set defaults if not already set
-            for key, value in chroma_defaults.items():
-                if not self.get(key):
-                    self.set(key, value)
-                    
-            logger.info(f"ChromaDB configuration: persist_dir={self.get('CHROMA_PERSIST_DIR')}, collection={self.get('CHROMA_COLLECTION')}")
     
     def _get_credential(self):
         """
@@ -225,7 +185,7 @@ class OSEnv:
             if key not in self.var_list:
                 self.var_list.append(key)
             if print_val:
-                if key in {'AZURE_CLIENT_SECRET', 'AD_USER_PW', 'PG_PASSWORD'}:
+                if key in {'AZURE_CLIENT_SECRET', 'AD_USER_PW'}:
                     logger.info(f"{key}: [REDACTED]")
                 else:
                     logger.info(f"{key}: {value}")
@@ -264,7 +224,7 @@ class OSEnv:
                 raise ValueError("Proxy settings are incomplete. Check AD_USERNAME, AD_USER_PW, and HTTPS_PROXY_DOMAIN")
             
             # Use http:// instead of https:// as the proxy only supports HTTP
-            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+            proxy_url = f"http://{ad_username}:{ad_password}{proxy_domain}"
             self.set("HTTP_PROXY", proxy_url, print_val=False)
             self.set("HTTPS_PROXY", proxy_url, print_val=False)
             
@@ -281,11 +241,6 @@ class OSEnv:
             custom_no_proxy = self.get("CUSTOM_NO_PROXY", "")
             if custom_no_proxy:
                 no_proxy_domains.extend(custom_no_proxy.split(","))
-            
-            # Add PostgreSQL host to NO_PROXY if it's not localhost
-            pg_host = self.get("PG_HOST")
-            if pg_host and pg_host not in ["localhost", "127.0.0.1"]:
-                no_proxy_domains.append(pg_host)
             
             self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
             logger.info("Proxy settings configured with HTTP protocol")
@@ -320,7 +275,7 @@ class OSEnv:
         List all environment variables (with sensitive values redacted).
         """
         for var in self.var_list:
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET', 'PG_PASSWORD'}:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
                 logger.info(f"{var}: [REDACTED]")
             else:
                 logger.info(f"{var}: {os.getenv(var)}")

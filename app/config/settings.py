@@ -65,15 +65,6 @@ def get_app_settings() -> Dict[str, Any]:
         Dict: Application settings
     """
     env = get_os_env()
-    pg_settings = {
-        "host": env.get("PG_HOST", ""),
-        "port": env.get("PG_PORT", ""),
-        "user": env.get("PG_USER", ""),
-        "database": env.get("PG_DB", ""),
-        "schema": env.get("PG_SCHEMA", "ai_stitching_platform"),
-        "min_connections": int(env.get("PG_MIN_CONNECTIONS", "1")),
-        "max_connections": int(env.get("PG_MAX_CONNECTIONS", "10"))
-    }
     
     model_settings = {
         "model": env.get("MODEL_NAME", "gpt-4o-mini"),
@@ -88,11 +79,16 @@ def get_app_settings() -> Dict[str, Any]:
         "domain": env.get("HTTPS_PROXY_DOMAIN", "")
     }
     
+    token_settings = {
+        "refresh_interval": int(env.get("TOKEN_REFRESH_INTERVAL", "300")),
+        "validation_threshold": int(env.get("TOKEN_VALIDATION_THRESHOLD", "600"))
+    }
+    
     monitoring_interval = int(env.get("MONITORING_INTERVAL", "300"))
     
     return {
-        "database": pg_settings,
         "model": model_settings,
         "proxy": proxy_settings,
+        "token": token_settings,
         "monitoring_interval": monitoring_interval
     }

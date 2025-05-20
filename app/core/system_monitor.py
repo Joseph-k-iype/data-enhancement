@@ -7,15 +7,17 @@ import logging
 import threading
 import time
 import psutil
-from typing import Optional
+from typing import Optional, Dict, Any, List
+
+from app.core.in_memory_job_store import job_store
 
 logger = logging.getLogger(__name__)
 
-# Global threading variables
+# Global monitoring variables
 _monitor_thread = None
 _stop_monitor = threading.Event()
 
-def get_system_stats():
+def get_system_stats() -> Dict[str, Any]:
     """
     Get current system resource usage stats.
     
@@ -48,54 +50,54 @@ def get_system_stats():
             "error": str(e)
         }
 
-def count_jobs_by_type():
+def count_jobs() -> Dict[str, int]:
     """
-    Count jobs by type in the database.
+    Count jobs by type in the in-memory job store.
     
     Returns:
         dict: Dictionary with job counts by type
     """
     try:
-        # Import here to avoid circular imports
-        from app.core.db_manager import DBManager
-        db = DBManager()
-        
-        # Get enhancement jobs
-        enhancement_jobs = db.get_jobs_by_type_and_status("enhancement")
+        # Get jobs from in-memory store
+        enhancement_jobs = job_store.get_jobs_by_type_and_status("enhancement")
+        active_jobs = [job for job in enhancement_jobs 
+                     if job["status"] in ["pending", "in_progress"]]
         
         return {
+            "total_jobs": len(enhancement_jobs),
+            "active_jobs": len(active_jobs),
             "enhancement_jobs_count": len(enhancement_jobs)
         }
     except Exception as e:
         logger.error(f"Error counting jobs: {e}")
         return {
+            "total_jobs": 0,
+            "active_jobs": 0, 
             "enhancement_jobs_count": 0,
             "error": str(e)
         }
 
-def record_stats_to_db():
-    """Record system stats to database."""
+def record_stats() -> bool:
+    """Record system stats to in-memory job store."""
     try:
-        # Import here to avoid circular imports
-        from app.core.db_manager import DBManager
-        db = DBManager()
-        
         # Get system stats
         stats = get_system_stats()
         
         # Get job counts
-        job_counts = count_jobs_by_type()
+        job_counts = count_jobs()
         
-        # Record stats
-        db.record_system_stats(
+        # Record stats to in-memory store
+        job_store.record_system_stats(
             cpu_usage=stats["cpu_usage"],
             memory_usage=stats["memory_usage"],
             enhancement_jobs_count=job_counts["enhancement_jobs_count"]
         )
         
-        logger.debug("Recorded system stats to database")
+        logger.debug("Recorded system stats successfully")
+        return True
     except Exception as e:
-        logger.error(f"Error recording stats to database: {e}")
+        logger.error(f"Error recording stats: {e}")
+        return False
 
 def monitoring_worker(interval: int):
     """
@@ -108,7 +110,7 @@ def monitoring_worker(interval: int):
     
     while not _stop_monitor.is_set():
         try:
-            record_stats_to_db()
+            record_stats()
         except Exception as e:
             logger.error(f"Error in monitoring worker: {e}")
         
@@ -147,3 +149,15 @@ def stop_monitoring():
         _stop_monitor.set()
         _monitor_thread.join(timeout=10)
         logger.info("Stopped system monitoring thread")
+
+def get_recent_stats(limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Get recent system statistics from in-memory store.
+    
+    Args:
+        limit: Maximum number of stats to return
+        
+    Returns:
+        List of stats entries
+    """
+    return job_store.get_system_stats(limit)
