@@ -2,8 +2,9 @@ import os
 import logging
 import threading
 import time
+import asyncio
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -12,7 +13,7 @@ class TokenCache:
     """Class to manage Azure tokens in memory with auto-refresh."""
     
     _instance = None
-    _lock = threading.Lock()
+    _lock = threading.RLock()  # Using RLock for better performance
     
     def __new__(cls):
         """Singleton pattern to ensure only one instance of the token cache."""
@@ -32,6 +33,7 @@ class TokenCache:
                 self._tokens = {}
                 self._refresh_thread = None
                 self._stop_refresh = threading.Event()
+                self._token_callbacks = []  # Callbacks for token refresh events
                 self._initialized = True
                 logger.info("Token cache initialized")
     
@@ -39,7 +41,7 @@ class TokenCache:
                   scope: str = "https://cognitiveservices.azure.com/.default",
                   force_refresh: bool = False) -> Optional[str]:
         """
-        Get a token from the cache, refreshing if necessary.
+        Get a token from the cache, with optimized refresh strategy.
         
         Args:
             tenant_id: Azure tenant ID
@@ -58,30 +60,82 @@ class TokenCache:
             if not force_refresh and cache_key in self._tokens:
                 token_data = self._tokens[cache_key]
                 
-                # Check if the token is still valid with a buffer
-                # Buffer is 10% of the expiration time or at least 5 minutes
+                # Use a smaller buffer for better token utilization
+                # Only refresh when < 5 minutes remaining
                 now = datetime.now()
                 expiry = token_data.get("expiry")
-                buffer = max(timedelta(minutes=5), timedelta(seconds=token_data.get("expires_in", 3600) * 0.1))
+                buffer = timedelta(minutes=5)
                 
                 if expiry and now < expiry - buffer:
-                    logger.debug(f"Using cached token (expires in {(expiry - now).total_seconds():.0f}s)")
                     return token_data.get("access_token")
+        
+        # Token not found or expired, get a new one
+        logger.info(f"Getting new token for {client_id} in tenant {tenant_id}")
+        token_data = self._fetch_new_token(tenant_id, client_id, client_secret, scope)
+        
+        if token_data and "access_token" in token_data:
+            # Cache the token with expiry time
+            expires_in = token_data.get("expires_in", 3600)
+            token_data["expiry"] = datetime.now() + timedelta(seconds=expires_in)
             
-            # Token not found or expired, get a new one
-            logger.info(f"Getting new token for {client_id} in tenant {tenant_id}")
-            token_data = self._fetch_new_token(tenant_id, client_id, client_secret, scope)
-            
-            if token_data and "access_token" in token_data:
-                # Cache the token with expiry time
-                expires_in = token_data.get("expires_in", 3600)
-                token_data["expiry"] = datetime.now() + timedelta(seconds=expires_in)
+            with self._lock:
                 self._tokens[cache_key] = token_data
-                logger.info(f"Token cached (expires in {expires_in}s)")
-                return token_data.get("access_token")
             
-            logger.error("Failed to get token")
-            return None
+            logger.info(f"Token cached (expires in {expires_in}s)")
+            
+            # Notify callbacks about the token refresh
+            for callback in self._token_callbacks:
+                try:
+                    callback(cache_key, token_data.get("access_token"))
+                except Exception as e:
+                    logger.error(f"Error in token refresh callback: {e}")
+            
+            return token_data.get("access_token")
+        
+        logger.error("Failed to get token")
+        return None
+    
+    async def get_token_async(self, tenant_id: str, client_id: str, client_secret: str, 
+                            scope: str = "https://cognitiveservices.azure.com/.default",
+                            force_refresh: bool = False) -> Optional[str]:
+        """
+        Asynchronous version of get_token.
+        
+        Args:
+            tenant_id: Azure tenant ID
+            client_id: Azure client ID
+            client_secret: Azure client secret
+            scope: Token scope
+            force_refresh: Whether to force a token refresh
+            
+        Returns:
+            str: The token, or None if retrieval failed
+        """
+        # Try to get from cache first
+        cache_key = f"{tenant_id}:{client_id}:{scope}"
+        
+        if not force_refresh:
+            with self._lock:
+                if cache_key in self._tokens:
+                    token_data = self._tokens[cache_key]
+                    
+                    now = datetime.now()
+                    expiry = token_data.get("expiry")
+                    buffer = timedelta(minutes=5)
+                    
+                    if expiry and now < expiry - buffer:
+                        return token_data.get("access_token")
+        
+        # Run the token fetch in a thread to avoid blocking
+        loop = asyncio.get_running_loop()
+        
+        # Use run_in_executor to run the synchronous method in a thread pool
+        token = await loop.run_in_executor(
+            None,
+            lambda: self.get_token(tenant_id, client_id, client_secret, scope, force_refresh)
+        )
+        
+        return token
     
     def _fetch_new_token(self, tenant_id: str, client_id: str, client_secret: str, 
                          scope: str) -> Optional[Dict[str, Any]]:
@@ -107,7 +161,10 @@ class TokenCache:
                 "grant_type": "client_credentials"
             }
             
-            response = requests.post(url, data=data, timeout=30)
+            # Use connection pooling for better performance
+            session = requests.Session()
+            
+            response = session.post(url, data=data, timeout=30)
             
             if response.status_code == 200:
                 return response.json()
@@ -118,7 +175,17 @@ class TokenCache:
             logger.error(f"Exception getting token: {e}")
             return None
     
-    def start_refresh_service(self, refresh_interval: int = 300):
+    def register_token_callback(self, callback: Callable[[str, str], None]) -> None:
+        """
+        Register a callback to be notified when a token is refreshed.
+        
+        Args:
+            callback: Function to call with (cache_key, token) when a token is refreshed
+        """
+        with self._lock:
+            self._token_callbacks.append(callback)
+    
+    def start_refresh_service(self, refresh_interval: int = 600):
         """
         Start a background thread to periodically refresh tokens.
         
@@ -164,9 +231,8 @@ class TokenCache:
                     for cache_key, token_data in self._tokens.items():
                         expiry = token_data.get("expiry")
                         
-                        # Use a larger buffer for auto-refresh (20% of expiration time)
-                        buffer = max(timedelta(minutes=10), 
-                                    timedelta(seconds=token_data.get("expires_in", 3600) * 0.2))
+                        # Use a larger buffer for auto-refresh (15 minutes)
+                        buffer = timedelta(minutes=15)
                         
                         if expiry and now > expiry - buffer:
                             # Token is approaching expiration, extract credentials
@@ -188,15 +254,25 @@ class TokenCache:
                             expires_in = token_data.get("expires_in", 3600)
                             token_data["expiry"] = datetime.now() + timedelta(seconds=expires_in)
                             self._tokens[cache_key] = token_data
-                            logger.info(f"Token refreshed (expires in {expires_in}s)")
+                            
+                        logger.info(f"Token refreshed (expires in {expires_in}s)")
+                        
+                        # Notify callbacks about the token refresh
+                        for callback in self._token_callbacks:
+                            try:
+                                callback(cache_key, token_data.get("access_token"))
+                            except Exception as e:
+                                logger.error(f"Error in token refresh callback: {e}")
                     else:
                         logger.error(f"Failed to refresh token for {client_id}")
             
             except Exception as e:
                 logger.error(f"Error in token refresh service: {e}")
             
-            # Sleep until next check
-            self._stop_refresh.wait(refresh_interval)
+            # Sleep until next check, but wake up every minute to check if we should stop
+            for _ in range(refresh_interval // 60):
+                if self._stop_refresh.wait(60):
+                    break
         
         logger.info("Token refresh service worker stopped")
 
@@ -221,17 +297,30 @@ def get_azure_token(tenant_id: str, client_id: str, client_secret: str,
     """
     return token_cache.get_token(tenant_id, client_id, client_secret, scope, force_refresh)
 
+async def get_azure_token_async(tenant_id: str, client_id: str, client_secret: str, 
+                              scope: str = "https://cognitiveservices.azure.com/.default",
+                              force_refresh: bool = False) -> Optional[str]:
+    """
+    Get an Azure token asynchronously, using the token cache.
+    
+    Args:
+        tenant_id: Azure tenant ID
+        client_id: Azure client ID
+        client_secret: Azure client secret
+        scope: Token scope
+        force_refresh: Whether to force a token refresh
+        
+    Returns:
+        str: The token, or None if retrieval failed
+    """
+    return await token_cache.get_token_async(tenant_id, client_id, client_secret, scope, force_refresh)
+
 def get_azure_token_cached(tenant_id: str, client_id: str, client_secret: str, 
                           scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
     """Alias for get_azure_token for backward compatibility."""
     return get_azure_token(tenant_id, client_id, client_secret, scope)
 
-def get_azure_token_manual(tenant_id: str, client_id: str, client_secret: str, 
-                          scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
-    """Alias for get_azure_token for backward compatibility."""
-    return get_azure_token(tenant_id, client_id, client_secret, scope)
-
-def initialize_token_caching(start_refresh_service: bool = True, refresh_interval: int = 300):
+def initialize_token_caching(start_refresh_service: bool = True, refresh_interval: int = 600):
     """
     Initialize the token caching system.
     

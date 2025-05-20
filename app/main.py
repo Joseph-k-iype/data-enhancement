@@ -9,9 +9,12 @@ import argparse
 import logging
 import os
 import sys
+import time
+import uuid
 from typing import Optional
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
@@ -22,8 +25,9 @@ from app.api.routes.enhancement import router as enhancement_router
 from app.api.routes.settings import router as settings_router
 from app.config.environment import get_os_env, str_to_bool
 from app.core.system_monitor import start_monitoring, stop_monitoring
-from app.core.in_memory_job_store import job_store
+from app.core.in_memory_job_store import optimized_job_store as job_store
 from app.utils.auth_helper import initialize_token_caching
+from app.utils.cache import setup_caching
 
 # Set up logging
 logging.basicConfig(
@@ -52,7 +56,7 @@ except ImportError:
 def create_application(
     proxy_enabled: bool = True, 
     monitoring_interval: int = 300,
-    token_refresh_interval: int = 300
+    token_refresh_interval: int = 600
 ) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -74,25 +78,54 @@ def create_application(
     initialize_token_caching(start_refresh_service=True, refresh_interval=token_refresh_interval)
     logger.info(f"Token caching system initialized with refresh interval: {token_refresh_interval}s")
     
+    # Initialize caching system
+    setup_caching()
+    logger.info("Caching system initialized")
+    
     logger.info(f"Proxy enabled: {env.get('PROXY_ENABLED')}")
     logger.info(f"Model name: {env.get('MODEL_NAME', 'gpt-4o-mini')}")
 
     # Check in-memory job store health
     store_health = job_store.health_check()
-    logger.info(f"In-memory job store initialized: {store_health}")
+    logger.info(f"Optimized in-memory job store initialized: {store_health}")
     
     app = FastAPI(
         title="Data Element Enhancement API",
         description="API for enhancing data elements to meet ISO/IEC 11179 standards.",
-        version="2.0.0", # Updated version
+        version="2.1.0", # Updated version
+        openapi_url="/api/openapi.json",
+        docs_url="/api/docs",
+        redoc_url="/api/redoc",
     )
     
+    # Add request ID middleware
+    @app.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        
+        start_time = time.time()
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = str(process_time)
+        
+        return response
+    
+    # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"], # Adjust for production
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+    
+    # Add GZip compression middleware
+    app.add_middleware(
+        GZipMiddleware,
+        minimum_size=1000,  # Only compress responses larger than 1KB
     )
     
     # Mount static files for dashboard
@@ -128,7 +161,7 @@ def create_application(
         # Add token caching status to health check
         token_caching_status = {
             "enabled": str_to_bool(current_env.get("TOKEN_CACHING_ENABLED", "True")),
-            "refresh_interval": int(current_env.get("TOKEN_REFRESH_INTERVAL", "300")),
+            "refresh_interval": int(current_env.get("TOKEN_REFRESH_INTERVAL", "600")),
             "validation_threshold": int(current_env.get("TOKEN_VALIDATION_THRESHOLD", "600"))
         }
 
@@ -139,7 +172,8 @@ def create_application(
             "azure_endpoint": current_env.get("AZURE_ENDPOINT", "Not Set"),
             "active_model": current_env.get("MODEL_NAME", "gpt-4o-mini"),
             "job_store_status": store_status,
-            "token_caching": token_caching_status
+            "token_caching": token_caching_status,
+            "api_version": current_env.get("API_VERSION", "2024-02-01")
         }
 
     @app.get("/", tags=["System"])
@@ -150,7 +184,7 @@ def create_application(
             "application_name": app.title,
             "version": app.version,
             "status": "API is operational",
-            "documentation_url": "/docs",
+            "documentation_url": "/api/docs",
             "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
             "token_caching_enabled": str_to_bool(current_env.get("TOKEN_CACHING_ENABLED", "True"))
         }
@@ -176,13 +210,14 @@ def parse_arguments():
     # Token caching settings
     parser.add_argument("--token-caching", dest="token_caching_enabled", action="store_true", default=True, help="Enable token caching")
     parser.add_argument("--no-token-caching", dest="token_caching_enabled", action="store_false", help="Disable token caching")
-    parser.add_argument("--token-refresh-interval", type=int, default=int(os.getenv("TOKEN_REFRESH_INTERVAL", "300")), help="Token refresh interval in seconds")
+    parser.add_argument("--token-refresh-interval", type=int, default=int(os.getenv("TOKEN_REFRESH_INTERVAL", "600")), help="Token refresh interval in seconds")
     parser.add_argument("--token-validation-threshold", type=int, default=int(os.getenv("TOKEN_VALIDATION_THRESHOLD", "600")), help="Minimum token validity time in seconds")
 
     # Model settings
     parser.add_argument("--model", type=str, default=os.getenv("MODEL_NAME", "gpt-4o-mini"), help="Azure OpenAI model to use")
     parser.add_argument("--max-tokens", type=int, default=int(os.getenv("MAX_TOKENS", "2000")), help="Maximum tokens for model responses")
     parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMPERATURE", "0.3")), help="Temperature for model responses")
+    parser.add_argument("--api-version", type=str, default=os.getenv("API_VERSION", "2024-02-01"), help="Azure OpenAI API version")
 
     # Config file paths (can be overridden by environment variables)
     parser.add_argument("--config-file", type=str, default=os.getenv("ENV_CONFIG_PATH", "env/config.env"), help="Path to config.env file")
@@ -199,12 +234,13 @@ if os.getenv("_FASTAPI_RELOAD") == "true" or __name__ != "__main__":
     # Uvicorn reload will handle re-running __main__ block.
     # Set environment variables that would normally be set by args for consistency
     os.environ.setdefault("TOKEN_CACHING_ENABLED", "True")
-    os.environ.setdefault("TOKEN_REFRESH_INTERVAL", "300")
+    os.environ.setdefault("TOKEN_REFRESH_INTERVAL", "600")
     os.environ.setdefault("TOKEN_VALIDATION_THRESHOLD", "600")
+    os.environ.setdefault("API_VERSION", "2024-02-01")
     app = create_application(
         proxy_enabled=str_to_bool(os.getenv("PROXY_ENABLED", "True")),
         monitoring_interval=int(os.getenv("MONITORING_INTERVAL", "300")),
-        token_refresh_interval=int(os.getenv("TOKEN_REFRESH_INTERVAL", "300"))
+        token_refresh_interval=int(os.getenv("TOKEN_REFRESH_INTERVAL", "600"))
     )
 
 if __name__ == "__main__":
@@ -222,6 +258,7 @@ if __name__ == "__main__":
     os.environ["MODEL_NAME"] = args.model
     os.environ["MAX_TOKENS"] = str(args.max_tokens)
     os.environ["TEMPERATURE"] = str(args.temperature)
+    os.environ["API_VERSION"] = args.api_version
     
     # Token caching settings
     os.environ["TOKEN_CACHING_ENABLED"] = str(args.token_caching_enabled)
@@ -238,6 +275,7 @@ if __name__ == "__main__":
     logger.info(f"Model: {args.model}")
     logger.info(f"Max Tokens: {args.max_tokens}")
     logger.info(f"Temperature: {args.temperature}")
+    logger.info(f"API Version: {args.api_version}")
     logger.info(f"Token Caching Enabled: {args.token_caching_enabled}")
     logger.info(f"Token Refresh Interval: {args.token_refresh_interval}s")
     logger.info(f"Token Validation Threshold: {args.token_validation_threshold}s")

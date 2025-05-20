@@ -1,26 +1,46 @@
-from typing import Dict, Any, List, Tuple
+"""
+Validator Agent - Validates data elements against ISO/IEC 11179 standards.
+"""
+
+from typing import Dict, Any, List, Tuple, Optional
 import re
 import logging
 import os
 import pandas as pd
+import asyncio
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import AzureChatOpenAI
 from app.core.models import DataElement, ValidationResult, DataQualityStatus, Process
 from app.utils.iso_standards import ISO11179Validator
+from app.utils.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 
 class ValidatorAgent:
+    """
+    Agent that validates data elements against ISO/IEC 11179 standards.
+    """
     
     def __init__(self, llm: AzureChatOpenAI):
+        """
+        Initialize the validator agent.
+        
+        Args:
+            llm: Language model instance
+        """
         self.llm = llm
         self.iso_validator = ISO11179Validator()
         self.approved_acronyms = self._load_approved_acronyms()
         self._setup_validation_chain()
     
     def _load_approved_acronyms(self):
-        """Load approved acronyms from CSV file."""
+        """
+        Load approved acronyms from CSV file.
+        
+        Returns:
+            Dict mapping acronyms to definitions
+        """
         approved_acronyms = {}
         try:
             csv_path = os.path.join("data", "acronyms.csv")
@@ -62,6 +82,7 @@ class ValidatorAgent:
         return processes_info
     
     def _setup_validation_chain(self):
+        """Set up the LangChain chain for validation."""
         template = """
         You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to evaluate the 
         given data element name and description against these standards to determine the quality of the metadata.
@@ -136,8 +157,67 @@ class ValidatorAgent:
             input_variables=["id", "name", "description", "example", "processes_info"],
             template=template)
         self.validation_chain = self.validation_prompt | self.llm | StrOutputParser()
+    
+    def _perform_basic_validation(self, data_element: DataElement) -> Tuple[List[str], bool, bool]:
+        """
+        Perform basic validation checks without using the LLM.
         
+        Args:
+            data_element: The data element to validate
+            
+        Returns:
+            Tuple containing:
+            - List of validation issues
+            - Whether the name is valid
+            - Whether the description is valid
+        """
+        basic_validation_issues = []
+        
+        # Validate name
+        name_valid, name_feedback = self.iso_validator.validate_name(data_element.existing_name)
+        if not name_valid:
+            basic_validation_issues.append(f"Name validation failed: {name_feedback}")
+        
+        # Validate description
+        desc_valid, desc_feedback = self.iso_validator.validate_description(data_element.existing_description)
+        if not desc_valid:
+            basic_validation_issues.append(f"Description validation failed: {desc_feedback}")
+        
+        # Check for acronyms (max 3 characters)
+        words = re.findall(r'\b[A-Z]{2,3}\b', data_element.existing_name + " " + data_element.existing_description)
+        acronym_info = ""
+        
+        if words:
+            approved_acronyms_found = []
+            contextual_acronyms = []
+            
+            for word in words:
+                if word in self.approved_acronyms:
+                    approved_acronyms_found.append(f"{word} ({self.approved_acronyms[word]})")
+                else:
+                    contextual_acronyms.append(word)
+            
+            # Add acronym info to feedback but don't mark invalid
+            if approved_acronyms_found:
+                acronym_info += f"\nFound approved acronyms: {', '.join(approved_acronyms_found)}"
+            if contextual_acronyms:
+                acronym_info += f"\nFound acronyms without context: {', '.join(contextual_acronyms)}"
+            
+            if acronym_info:
+                basic_validation_issues.append(acronym_info)
+        
+        return basic_validation_issues, name_valid, desc_valid
+    
     def _parse_validation_result(self, result: str) -> ValidationResult:
+        """
+        Parse the validation result from the LLM.
+        
+        Args:
+            result: The LLM output
+            
+        Returns:
+            ValidationResult: Parsed validation result
+        """
         # Clean up the result
         result = result.replace("**", "").replace("```", "")
         lines = result.strip().split("\n")
@@ -224,57 +304,26 @@ class ValidatorAgent:
             suggested_improvements=improvements
         )
     
+    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
     async def validate(self, data_element: DataElement) -> ValidationResult:
-        """Validate a data element against ISO/IEC 11179 standards with approved acronyms."""
+        """
+        Validate a data element against ISO/IEC 11179 standards with approved acronyms.
+        
+        Args:
+            data_element: The data element to validate
+            
+        Returns:
+            ValidationResult: The validation result
+        """
         try:
             # First, perform basic validation
-            name_valid, name_feedback = self.iso_validator.validate_name(data_element.existing_name)
-            desc_valid, desc_feedback = self.iso_validator.validate_description(data_element.existing_description)
-            
-            # Only check for acronyms if uppercase terms are found (max 3 characters)
-            words = re.findall(r'\b[A-Z]{2,3}\b', data_element.existing_name + " " + data_element.existing_description)
-            acronym_info = ""
-            
-            if words:
-                approved_acronyms_found = []
-                contextual_acronyms = []
-                
-                for word in words:
-                    if word in self.approved_acronyms:
-                        approved_acronyms_found.append(f"{word} ({self.approved_acronyms[word]})")
-                    else:
-                        contextual_acronyms.append(word)
-                
-                # Add acronym info to feedback but don't mark invalid
-                if approved_acronyms_found:
-                    acronym_info += f"\nFound approved acronyms: {', '.join(approved_acronyms_found)}"
-                if contextual_acronyms:
-                    acronym_info += f"\nFound acronyms without context: {', '.join(contextual_acronyms)}"
-                
-                name_feedback += acronym_info
-            
-            # Always proceed with the LLM validation to get comprehensive feedback,
-            # even if basic validation fails
-            basic_validation_issues = []
-            if not name_valid:
-                basic_validation_issues.append(f"Name validation failed: {name_feedback}")
-            if not desc_valid:
-                basic_validation_issues.append(f"Description validation failed: {desc_feedback}")
+            basic_validation_issues, name_valid, desc_valid = self._perform_basic_validation(data_element)
             
             # Format processes information
             processes_info = self._format_processes_info(data_element)
             
-            # We'll include this information in the prompt rather than returning early
-            
-            # Update the prompt with contextual information
-            template = self.validation_prompt.template
-            
-            # Add any acronym context that was found
+            # Build context information
             context_info = ""
-            if acronym_info:
-                context_info += f"Acronym context for this validation:\n{acronym_info}\n\n"
-            
-            # Add any basic validation issues that were found
             if basic_validation_issues:
                 context_info += "Basic validation issues detected:\n"
                 for issue in basic_validation_issues:
@@ -282,9 +331,10 @@ class ValidatorAgent:
                 context_info += "\nPlease validate both name and description comprehensively regardless.\n\n"
             
             # Add the context to the template if we have any
+            template = self.validation_prompt.template
             if context_info:
                 template = template.replace("Data Element to Evaluate:", 
-                                           f"Additional Context Information:\n{context_info}\nData Element to Evaluate:")
+                                         f"Additional Context Information:\n{context_info}\nData Element to Evaluate:")
             
             # Create a custom prompt for this validation
             custom_prompt = PromptTemplate(
@@ -311,3 +361,19 @@ class ValidatorAgent:
                 feedback=f"Error during validation: {str(e)}",
                 suggested_improvements=["Retry validation after resolving the error"]
             )
+    
+    async def batch_validate(self, data_elements: List[DataElement]) -> List[ValidationResult]:
+        """
+        Validate multiple data elements in parallel.
+        
+        Args:
+            data_elements: List of data elements to validate
+            
+        Returns:
+            List of validation results
+        """
+        # Create tasks for all validations
+        tasks = [self.validate(element) for element in data_elements]
+        
+        # Run all tasks concurrently
+        return await asyncio.gather(*tasks)

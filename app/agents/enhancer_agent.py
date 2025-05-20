@@ -1,18 +1,35 @@
+"""
+Enhancer Agent - Enhances data elements to meet ISO/IEC 11179 standards.
+"""
+
 import re
 import os
 import logging
 import pandas as pd
-from typing import Dict, Any, List, Tuple
+import asyncio
+from typing import Dict, Any, List, Tuple, Optional
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import AzureChatOpenAI
 from app.core.models import DataElement, EnhancementResult, ValidationResult, DataQualityStatus, Process
 from app.agents.validator_agent import ValidatorAgent
+from app.utils.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 
 class EnhancerAgent:
+    """
+    Agent that enhances data elements to meet ISO/IEC 11179 standards.
+    """
+    
     def __init__(self, llm: AzureChatOpenAI, acronym_file_path=None):
+        """
+        Initialize the enhancer agent.
+        
+        Args:
+            llm: Language model instance
+            acronym_file_path: Path to acronym definitions file
+        """
         self.llm = llm
         self.acronyms = self._load_acronyms(acronym_file_path)
         self._setup_enhancement_chain()
@@ -20,7 +37,15 @@ class EnhancerAgent:
         self.validator = ValidatorAgent(llm)
     
     def _load_acronyms(self, acronym_file_path=None):
-        """Load acronyms and their definitions from a CSV file."""
+        """
+        Load acronyms and their definitions from a CSV file.
+        
+        Args:
+            acronym_file_path: Path to acronym definitions file
+            
+        Returns:
+            Dict mapping acronyms to definitions
+        """
         acronyms = {}
         try:
             # Use default path if not provided
@@ -48,6 +73,7 @@ class EnhancerAgent:
         return acronyms
     
     def _setup_enhancement_chain(self):
+        """Set up the LangChain chain for enhancement."""
         template = """
         You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to enhance the 
         given data element name and description to meet these standards and represent high-quality metadata.
@@ -252,6 +278,15 @@ class EnhancerAgent:
         return processes_info
     
     def _parse_enhancement_result(self, result: str)->EnhancementResult:
+        """
+        Parse the enhancement result from the LLM.
+        
+        Args:
+            result: The LLM output
+            
+        Returns:
+            EnhancementResult: Parsed enhancement result
+        """
         enhanced_name = ""
         enhanced_description = ""
         feedback = ""
@@ -345,10 +380,11 @@ class EnhancerAgent:
         # Use validator agent to check quality
         return await self.validator.validate(data_element)
     
+    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
     async def enhance_until_quality(self, data_element: DataElement, 
-                                    validation_feedback: str = "", 
-                                    additional_context: str = "",
-                                    max_iterations: int = 3) -> Tuple[EnhancementResult, ValidationResult]:
+                                  validation_feedback: str = "", 
+                                  additional_context: str = "",
+                                  max_iterations: int = 3) -> Tuple[EnhancementResult, ValidationResult]:
         """
         Enhance a data element repeatedly until quality is good or max iterations reached.
         
@@ -372,8 +408,11 @@ class EnhancerAgent:
             iteration += 1
             logger.info(f"Enhancement iteration {iteration} for element: {current_element.id}")
             
+            # Run enhancement and validation concurrently for better performance
+            enhancement_task = asyncio.create_task(self.enhance(current_element, current_feedback, additional_context))
+            
             # Get current enhancement
-            enhancement_result = await self.enhance(current_element, current_feedback, additional_context)
+            enhancement_result = await enhancement_task
             
             # Create a test element with the enhanced data
             test_element = DataElement(
@@ -413,6 +452,7 @@ class EnhancerAgent:
             
         return last_enhancement, last_validation
     
+    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
     async def enhance(self, data_element: DataElement, validation_feedback: str = "", additional_context: str = "") -> EnhancementResult:
         """
         Enhance a data element based on validation feedback and additional context.
@@ -460,3 +500,21 @@ class EnhancerAgent:
                 feedback=f"Error during enhancement: {str(e)}",
                 confidence=0.0
             )
+    
+    async def batch_enhance(self, data_elements: List[DataElement], validation_feedback: str = "", additional_context: str = "") -> List[EnhancementResult]:
+        """
+        Enhance multiple data elements in parallel.
+        
+        Args:
+            data_elements: List of data elements to enhance
+            validation_feedback: Feedback from validation process
+            additional_context: Additional contextual information
+            
+        Returns:
+            List of enhancement results
+        """
+        # Create tasks for all enhancements
+        tasks = [self.enhance(element, validation_feedback, additional_context) for element in data_elements]
+        
+        # Run all tasks concurrently
+        return await asyncio.gather(*tasks)

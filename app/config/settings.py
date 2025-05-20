@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def get_llm(proxy_enabled: Optional[bool] = True) -> AzureChatOpenAI:
     """
-    Get a Language Model instance with token management.
+    Get a Language Model instance with optimized token management.
     
     Args:
         proxy_enabled: Whether to enable proxy settings
@@ -23,6 +23,10 @@ def get_llm(proxy_enabled: Optional[bool] = True) -> AzureChatOpenAI:
         AzureChatOpenAI: The language model
     """
     env = get_os_env(proxy_enabled=proxy_enabled)
+    
+    # Updated API version for better performance
+    api_version = "2024-02-01"  # Update from "2023-05-15" to latest version
+    
     try:
         # Get token using the token caching mechanism
         token = get_azure_token(
@@ -34,7 +38,6 @@ def get_llm(proxy_enabled: Optional[bool] = True) -> AzureChatOpenAI:
         
         if token:
             logger.info("Token retrieved successfully.")
-            # Create a function that returns the token
             token_provider = lambda: token
         else:
             logger.error("Failed to retrieve token.")
@@ -43,19 +46,24 @@ def get_llm(proxy_enabled: Optional[bool] = True) -> AzureChatOpenAI:
         logger.error(f"Error retrieving token: {e}")
         raise ValueError("Failed to retrieve token.")
     
-    model_name = env.get("MODEL_NAME", "gpt-4o-mini")
+    model_name = env.get("MODEL_NAME", "gpt-4o-mini")  # Use faster model as default
     max_tokens = env.get("MAX_TOKENS", 2000)
     temperature = env.get("TEMPERATURE", 0.3)
-    api_version = env.get("API_VERSION", "2023-05-15")
     azure_endpoint = env.get("AZURE_ENDPOINT", "")
     
+    # Add performance optimizations
     return AzureChatOpenAI(
         model_name=model_name,
         max_tokens=int(max_tokens),
         temperature=float(temperature),
         api_version=api_version,
         azure_endpoint=azure_endpoint,
-        azure_ad_token_provider=token_provider)
+        azure_ad_token_provider=token_provider,
+        streaming=True,  # Enable streaming for faster perceived response
+        request_timeout=60.0,  # Increase timeout for more reliable responses
+        max_retries=3,  # Increase retries for reliability
+        cache=True,  # Enable caching for repeat queries
+    )
     
 def get_app_settings() -> Dict[str, Any]:
     """
@@ -70,7 +78,7 @@ def get_app_settings() -> Dict[str, Any]:
         "model": env.get("MODEL_NAME", "gpt-4o-mini"),
         "max_tokens": int(env.get("MAX_TOKENS", "2000")),
         "temperature": float(env.get("TEMPERATURE", "0.3")),
-        "api_version": env.get("API_VERSION", "2023-05-15"),
+        "api_version": env.get("API_VERSION", "2024-02-01"),  # Updated to latest
         "azure_endpoint": env.get("AZURE_ENDPOINT", ""),
     }
     
@@ -80,7 +88,7 @@ def get_app_settings() -> Dict[str, Any]:
     }
     
     token_settings = {
-        "refresh_interval": int(env.get("TOKEN_REFRESH_INTERVAL", "300")),
+        "refresh_interval": int(env.get("TOKEN_REFRESH_INTERVAL", "600")),  # Increased from 300
         "validation_threshold": int(env.get("TOKEN_VALIDATION_THRESHOLD", "600"))
     }
     
