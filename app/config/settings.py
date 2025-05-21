@@ -6,11 +6,16 @@ import os
 import logging
 from typing import Optional, Union, Dict, Any, List, Set
 from pydantic import BaseModel, Field, validator
+import langchain
+from langchain.cache import InMemoryCache
 from app.config.environment import get_os_env
 from langchain_openai import AzureChatOpenAI
 from app.utils.auth_helper import get_azure_token
 
 logger = logging.getLogger(__name__)
+
+# Initialize LangChain cache
+langchain.llm_cache = InMemoryCache()
 
 def get_llm(proxy_enabled: Optional[bool] = True) -> AzureChatOpenAI:
     """
@@ -62,7 +67,7 @@ def get_llm(proxy_enabled: Optional[bool] = True) -> AzureChatOpenAI:
         streaming=True,  # Enable streaming for faster perceived response
         request_timeout=60.0,  # Increase timeout for more reliable responses
         max_retries=3,  # Increase retries for reliability
-        cache=True,  # Enable caching for repeat queries
+        cache=True,  # Enable LangChain's caching for repeat queries
     )
     
 def get_app_settings() -> Dict[str, Any]:

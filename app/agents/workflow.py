@@ -1,3 +1,8 @@
+"""
+Improved workflow that combines validation and enhancement in fewer LLM calls.
+Replace app/agents/workflow.py with this optimized version.
+"""
+
 import logging
 import asyncio
 import re
@@ -16,9 +21,7 @@ from app.core.models import (
     DataQualityStatus,
     Process
 )
-from app.agents.validator_agent import ValidatorAgent
-from app.agents.enhancer_agent import EnhancerAgent
-from app.agents.confidence_evaluator import ConfidenceEvaluator
+from app.utils.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 
@@ -39,203 +42,12 @@ class OptimizedDataEnhancementWorkflow:
     
     def __init__(self, llm: AzureChatOpenAI):
         self.llm = llm
-        self.validator = ValidatorAgent(llm)
-        self.enhancer = EnhancerAgent(llm)
-        self.confidence_evaluator = ConfidenceEvaluator(llm)
         self.graph = self._build_graph()
-    
-    def _convert_processes_to_model(self, processes_data):
-        """Safely convert process data to Process objects if needed."""
-        if not processes_data:
-            return None
-            
-        processes_list = []
-        for proc in processes_data:
-            # If already a Process object, use directly
-            if isinstance(proc, Process):
-                processes_list.append(proc)
-            # If a dict, convert to Process object
-            elif isinstance(proc, dict):
-                processes_list.append(Process(**proc))
-            else:
-                logger.warning(f"Unknown process type: {type(proc)}")
         
-        return processes_list
-    
-    def _format_processes_info(self, data_element: DataElement) -> str:
-        """
-        Format the processes information for the prompt.
-        
-        Args:
-            data_element: The data element containing processes
-            
-        Returns:
-            str: Formatted processes information
-        """
-        if not data_element.processes:
-            return "Related Processes: None"
-        
-        processes = data_element.processes
-        # Ensure processes are Process objects
-        if not all(isinstance(p, Process) for p in processes):
-            # Try to convert dictionaries to Process objects
-            processes = []
-            for p in data_element.processes:
-                if isinstance(p, Process):
-                    processes.append(p)
-                elif isinstance(p, dict):
-                    processes.append(Process(**p))
-                else:
-                    logger.warning(f"Unknown process type: {type(p)}")
-        
-        processes_info = "Related Processes:\n"
-        
-        for i, process in enumerate(processes, 1):
-            processes_info += f"Process {i} ID: {process.process_id}\n"
-            processes_info += f"Process {i} Name: {process.process_name}\n"
-            if process.process_description:
-                processes_info += f"Process {i} Description: {process.process_description}\n"
-            processes_info += "\n"
-        
-        return processes_info
-    
-    async def _combined_validate_enhance(self, state: WorkflowState) -> WorkflowState:
-        """
-        Combine validation and enhancement in a single LLM call to reduce latency.
-        """
-        try:
-            # Handle processes correctly
-            data_element_dict = state["data_element"].copy()
-            
-            # Convert processes if present
-            if data_element_dict.get("processes"):
-                data_element_dict["processes"] = self._convert_processes_to_model(data_element_dict.get("processes", []))
-            
-            original_element = DataElement(**data_element_dict)
-            
-            # Check if this is the first iteration or if we should use existing enhanced data
-            if state["iterations"] == 0:
-                # For the first iteration, we'll use a combined prompt that validates and enhances
-                combined_result = await self._combined_validation_enhancement(original_element)
-                
-                state["validation_result"] = combined_result["validation"].dict()
-                state["enhancement_result"] = combined_result["enhancement"].dict()
-                
-                # Set enhanced data
-                processes_dicts = None
-                if original_element.processes:
-                    processes_dicts = [proc.dict() for proc in original_element.processes]
-                
-                enhanced_data = {
-                    **state["data_element"],
-                    "enhanced_name": combined_result["enhancement"].enhanced_name,
-                    "enhanced_description": combined_result["enhancement"].enhanced_description,
-                    "processes": processes_dicts,
-                    "quality_status": combined_result["validation"].quality_status,
-                    "enhancement_iterations": 1,
-                    "enhancement_feedback": [combined_result["enhancement"].feedback],
-                    "validation_feedback": [combined_result["validation"].feedback],
-                    "confidence_score": combined_result["enhancement"].confidence
-                }
-                state["enhanced_data"] = enhanced_data
-            else:
-                # For subsequent iterations, use existing enhanced data
-                if state.get("enhanced_data"):
-                    data_to_process = DataElement(
-                        id=state["data_element"]["id"],
-                        existing_name=state["enhanced_data"]["enhanced_name"],
-                        existing_description=state["enhanced_data"]["enhanced_description"],
-                        example=state["data_element"].get("example"),
-                        processes=original_element.processes,
-                        cdm=state["data_element"].get("cdm")
-                    )
-                else:
-                    data_to_process = original_element
-                
-                # Run validation and enhancement concurrently for better performance
-                validation_task = asyncio.create_task(self.validator.validate(data_to_process))
-                
-                # For enhancement, use any validation feedback from the previous iteration
-                validation_feedback = ""
-                if state.get("validation_result"):
-                    validation_feedback = state["validation_result"].get("feedback", "")
-                    if state["validation_result"].get("suggested_improvements"):
-                        validation_feedback += "\n\nSuggested improvements:\n" + "\n".join(
-                            state["validation_result"]["suggested_improvements"]
-                        )
-                
-                enhancement_task = asyncio.create_task(self.enhancer.enhance(data_to_process, validation_feedback))
-                
-                # Wait for both tasks to complete
-                validation_result, enhancement_result = await asyncio.gather(validation_task, enhancement_task)
-                
-                state["validation_result"] = validation_result.dict()
-                state["enhancement_result"] = enhancement_result.dict()
-                
-                # Update enhanced data
-                if not state.get("enhanced_data"):
-                    processes_dicts = None
-                    if original_element.processes:
-                        processes_dicts = [proc.dict() for proc in original_element.processes]
-                    
-                    enhanced_data = {
-                        **state["data_element"],
-                        "enhanced_name": enhancement_result.enhanced_name,
-                        "enhanced_description": enhancement_result.enhanced_description,
-                        "processes": processes_dicts,
-                        "quality_status": validation_result.quality_status,
-                        "enhancement_iterations": 1,
-                        "enhancement_feedback": [enhancement_result.feedback],
-                        "validation_feedback": [validation_result.feedback],
-                        "confidence_score": enhancement_result.confidence
-                    }
-                    state["enhanced_data"] = enhanced_data
-                else:
-                    # Update the confidence score based on new quality status
-                    if validation_result.quality_status == DataQualityStatus.GOOD:
-                        new_confidence = 1.0
-                    elif validation_result.quality_status == DataQualityStatus.NEEDS_IMPROVEMENT:
-                        new_confidence = 0.8
-                    else:
-                        new_confidence = 0.5
-                    
-                    state["enhanced_data"]["enhanced_name"] = enhancement_result.enhanced_name
-                    state["enhanced_data"]["enhanced_description"] = enhancement_result.enhanced_description
-                    state["enhanced_data"]["enhancement_iterations"] = state["enhanced_data"].get("enhancement_iterations", 0) + 1
-                    state["enhanced_data"]["confidence_score"] = new_confidence
-                    state["enhanced_data"]["quality_status"] = validation_result.quality_status
-                    
-                    if "enhancement_feedback" not in state["enhanced_data"]:
-                        state["enhanced_data"]["enhancement_feedback"] = []
-                    state["enhanced_data"]["enhancement_feedback"].append(enhancement_result.feedback)
-                    
-                    if "validation_feedback" not in state["enhanced_data"]:
-                        state["enhanced_data"]["validation_feedback"] = []
-                    state["enhanced_data"]["validation_feedback"].append(validation_result.feedback)
-            
-            # Increment iteration counter
-            state["iterations"] = state["iterations"] + 1
-            
-            return state
-        except Exception as e:
-            logger.error(f"Combined validation/enhancement error: {e}")
-            state["error"] = f"Error in validation/enhancement: {str(e)}"
-            state["is_complete"] = True
-            return state
-    
-    async def _combined_validation_enhancement(self, data_element: DataElement) -> Dict[str, Any]:
-        """
-        Perform validation and enhancement in a single LLM call to reduce latency.
-        
-        Args:
-            data_element: The data element to validate and enhance
-            
-        Returns:
-            Dict containing ValidationResult and EnhancementResult
-        """
-        try:
-            # Create a combined prompt that does both validation and enhancement
-            template = """
+        # Set up the single-call prompt for both validation and enhancement
+        self.combined_prompt = PromptTemplate(
+            input_variables=["id", "name", "description", "example", "processes_info"],
+            template="""
             You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to:
             1. VALIDATE the given data element name and description against ISO standards
             2. ENHANCE the data element to meet these standards
@@ -281,53 +93,122 @@ class OptimizedDataEnhancementWorkflow:
             
             Your response MUST include both sections (VALIDATION and ENHANCEMENT).
             """
+        )
+        self.combined_chain = self.combined_prompt | self.llm | StrOutputParser()
+    
+    def _convert_processes_to_model(self, processes_data):
+        """Safely convert process data to Process objects if needed."""
+        if not processes_data:
+            return None
             
-            # Format processes info
-            processes_info = self._format_processes_info(data_element)
+        processes_list = []
+        for proc in processes_data:
+            # If already a Process object, use directly
+            if isinstance(proc, Process):
+                processes_list.append(proc)
+            # If a dict, convert to Process object
+            elif isinstance(proc, dict):
+                processes_list.append(Process(**proc))
+            else:
+                logger.warning(f"Unknown process type: {type(proc)}")
+        
+        return processes_list
+    
+    def _format_processes_info(self, data_element: DataElement) -> str:
+        """Format the processes information for the prompt."""
+        if not data_element.processes:
+            return "Related Processes: None"
+        
+        processes = data_element.processes
+        # Ensure processes are Process objects
+        if not all(isinstance(p, Process) for p in processes):
+            # Convert dictionaries to Process objects
+            processes = self._convert_processes_to_model(data_element.processes)
+        
+        processes_info = "Related Processes:\n"
+        
+        for i, process in enumerate(processes, 1):
+            processes_info += f"Process {i} ID: {process.process_id}\n"
+            processes_info += f"Process {i} Name: {process.process_name}\n"
+            if process.process_description:
+                processes_info += f"Process {i} Description: {process.process_description}\n"
+            processes_info += "\n"
+        
+        return processes_info
+    
+    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
+    async def _single_call_enhancement(self, state: WorkflowState) -> WorkflowState:
+        """Perform validation and enhancement in a single LLM call to reduce latency."""
+        try:
+            # Handle processes correctly
+            data_element_dict = state["data_element"].copy()
             
-            # Create the prompt
-            prompt = PromptTemplate(
-                input_variables=["id", "name", "description", "example", "processes_info"],
-                template=template
-            )
+            # Convert processes if present
+            if data_element_dict.get("processes"):
+                data_element_dict["processes"] = self._convert_processes_to_model(data_element_dict.get("processes", []))
             
-            # Create the chain
-            chain = prompt | self.llm | StrOutputParser()
+            original_element = DataElement(**data_element_dict)
             
-            # Invoke the chain
-            result = await chain.ainvoke({
-                "id": data_element.id,
-                "name": data_element.existing_name,
-                "description": data_element.existing_description,
-                "example": data_element.example or "Not provided",
+            # Format processes information
+            processes_info = self._format_processes_info(original_element)
+            
+            # Perform the combined validation and enhancement in a single call
+            start_time = asyncio.get_event_loop().time()
+            combined_result = await self.combined_chain.ainvoke({
+                "id": original_element.id,
+                "name": original_element.existing_name,
+                "description": original_element.existing_description,
+                "example": original_element.example or "Not provided",
                 "processes_info": processes_info
             })
+            elapsed = asyncio.get_event_loop().time() - start_time
+            logger.info(f"Combined validation and enhancement completed in {elapsed:.2f}s")
             
-            # Parse the result
-            validation_result = self._parse_validation_section(result)
-            enhancement_result = self._parse_enhancement_section(result)
+            # Parse the validation and enhancement results
+            validation_result = self._parse_validation_section(combined_result)
+            enhancement_result = self._parse_enhancement_section(combined_result)
             
-            return {
-                "validation": validation_result,
-                "enhancement": enhancement_result
+            # Update state with results
+            state["validation_result"] = validation_result.dict()
+            state["enhancement_result"] = enhancement_result.dict()
+            
+            # Set enhanced data
+            processes_dicts = None
+            if original_element.processes:
+                processes_dicts = [proc.dict() for proc in original_element.processes]
+            
+            # Calculate confidence score based on quality status
+            confidence_score = enhancement_result.confidence
+            if validation_result.quality_status == DataQualityStatus.GOOD:
+                confidence_score = max(confidence_score, 0.9)  # Boost confidence for good quality
+            
+            enhanced_data = {
+                **state["data_element"],
+                "enhanced_name": enhancement_result.enhanced_name,
+                "enhanced_description": enhancement_result.enhanced_description,
+                "processes": processes_dicts,
+                "quality_status": validation_result.quality_status,
+                "enhancement_iterations": 1,
+                "enhancement_feedback": [enhancement_result.feedback],
+                "validation_feedback": [validation_result.feedback],
+                "confidence_score": confidence_score
             }
+            state["enhanced_data"] = enhanced_data
+            
+            # Increment iteration counter
+            state["iterations"] = state["iterations"] + 1
+            
+            # Check if we've achieved good quality
+            if validation_result.quality_status == DataQualityStatus.GOOD:
+                logger.info(f"Achieved GOOD quality on first attempt for element: {original_element.id}")
+                state["is_complete"] = True
+            
+            return state
         except Exception as e:
             logger.error(f"Error in combined validation/enhancement: {e}")
-            # Return default results
-            return {
-                "validation": ValidationResult(
-                    is_valid=False,
-                    quality_status=DataQualityStatus.POOR,
-                    feedback=f"Error during validation: {str(e)}",
-                    suggested_improvements=["Retry validation after resolving the error"]
-                ),
-                "enhancement": EnhancementResult(
-                    enhanced_name=data_element.existing_name,
-                    enhanced_description=data_element.existing_description,
-                    feedback=f"Error during enhancement: {str(e)}",
-                    confidence=0.0
-                )
-            }
+            state["error"] = f"Error in validation/enhancement: {str(e)}"
+            state["is_complete"] = True
+            return state
     
     def _parse_validation_section(self, result: str) -> ValidationResult:
         """Parse the validation section of the combined result."""
@@ -474,18 +355,6 @@ class OptimizedDataEnhancementWorkflow:
             confidence=confidence
         )
     
-    async def _complete_workflow(self, state: WorkflowState) -> WorkflowState:
-        """Mark the workflow as complete."""
-        state["is_complete"] = True
-        logger.info("Workflow completed")
-        
-        # Add a final confidence evaluation if needed
-        if state.get("enhanced_data") and state["enhanced_data"]["quality_status"] == DataQualityStatus.GOOD:
-            logger.info("Enhancement achieved GOOD quality - setting high confidence")
-            state["enhanced_data"]["confidence_score"] = 1.0
-        
-        return state
-    
     def _should_continue(self, state: WorkflowState) -> str:
         """Determine if the process should continue or complete."""
         # Check if we've hit the maximum number of iterations
@@ -504,24 +373,36 @@ class OptimizedDataEnhancementWorkflow:
             logger.info("Enhanced data quality status is GOOD, completing workflow")
             return "complete"
         
-        # Continue the process
+        # Continue the process only if quality is not good and we haven't reached max iterations
         logger.info(f"Quality status is {quality_status}, continuing enhancement")
         return "continue"
+    
+    async def _complete_workflow(self, state: WorkflowState) -> WorkflowState:
+        """Mark the workflow as complete."""
+        state["is_complete"] = True
+        logger.info("Workflow completed")
+        
+        # Add a final confidence evaluation if needed
+        if state.get("enhanced_data") and state["enhanced_data"]["quality_status"] == DataQualityStatus.GOOD:
+            logger.info("Enhancement achieved GOOD quality - setting high confidence")
+            state["enhanced_data"]["confidence_score"] = 1.0
+        
+        return state
     
     def _build_graph(self) -> StateGraph:
         """Build the optimized LangGraph workflow."""
         workflow = StateGraph(WorkflowState)
         
         # Add nodes
-        workflow.add_node("combined_validate_enhance", self._combined_validate_enhance)
+        workflow.add_node("single_call_enhancement", self._single_call_enhancement)
         workflow.add_node("complete", self._complete_workflow)
         
         # Add conditional edges
         workflow.add_conditional_edges(
-            "combined_validate_enhance",
+            "single_call_enhancement",
             self._should_continue,
             {
-                "continue": "combined_validate_enhance",
+                "continue": "single_call_enhancement",
                 "complete": "complete"
             }
         )
@@ -530,17 +411,18 @@ class OptimizedDataEnhancementWorkflow:
         workflow.add_edge("complete", END)
         
         # Set entrypoint
-        workflow.set_entry_point("combined_validate_enhance")
+        workflow.set_entry_point("single_call_enhancement")
         
         return workflow.compile()
     
-    async def run(self, data_element: DataElement, max_iterations: int = 5) -> EnhancedDataElement:
+    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
+    async def run(self, data_element: DataElement, max_iterations: int = 2) -> EnhancedDataElement:
         """
         Run the data enhancement workflow on a data element.
         
         Args:
             data_element: The data element to enhance
-            max_iterations: Maximum number of enhancement iterations to perform
+            max_iterations: Maximum number of enhancement iterations to perform (default reduced to 2)
         
         Returns:
             Enhanced data element
@@ -591,16 +473,10 @@ class OptimizedDataEnhancementWorkflow:
         logger.info(f"Workflow completed with {result['enhanced_data'].get('enhancement_iterations', 0)} iterations")
         return EnhancedDataElement(**result["enhanced_data"])
     
-    async def stream_run(self, data_element: DataElement, max_iterations: int = 5) -> AsyncGenerator[Dict[str, Any], None]:
+    async def stream_run(self, data_element: DataElement, max_iterations: int = 2) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Run the workflow and stream results after each iteration.
-        
-        Args:
-            data_element: The data element to enhance
-            max_iterations: Maximum number of enhancement iterations to perform
-            
-        Yields:
-            Dict with the current state of the enhancement
+        Max iterations reduced to 2 for better performance.
         """
         # Convert processes to dict for serializing in the state
         element_dict = data_element.dict()
@@ -631,7 +507,7 @@ class OptimizedDataEnhancementWorkflow:
         
         try:
             # Run first iteration
-            state = await self._combined_validate_enhance(state)
+            state = await self._single_call_enhancement(state)
             
             if state.get("error"):
                 yield {
@@ -657,14 +533,14 @@ class OptimizedDataEnhancementWorkflow:
                 }
             }
             
-            # Continue iterations until complete
+            # Continue iterations until complete or hit limit
             while not state["is_complete"] and state["iterations"] < max_iterations:
                 if self._should_continue(state) == "complete":
                     state = await self._complete_workflow(state)
                     break
                 
                 # Run next iteration
-                state = await self._combined_validate_enhance(state)
+                state = await self._single_call_enhancement(state)
                 
                 if state.get("error"):
                     yield {
