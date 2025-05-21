@@ -12,368 +12,308 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import AzureChatOpenAI
 from app.core.models import DataElement, ValidationResult, DataQualityStatus, Process
-from app.utils.iso_standards import ISO11179Validator
+from app.utils.iso_standards import ISO11179Validator # Assuming this utility class exists
 from app.utils.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 
 class ValidatorAgent:
     """
-    Agent that validates data elements against ISO/IEC 11179 standards.
+    Agent that validates data elements against ISO/IEC 11179 standards,
+    focusing on contextual meaning, OPR model for names, and layperson understandability.
     """
-    
+
     def __init__(self, llm: AzureChatOpenAI):
         """
         Initialize the validator agent.
-        
+
         Args:
             llm: Language model instance
         """
         self.llm = llm
+        # ISO11179Validator can be used for very basic preliminary checks if desired,
+        # but the LLM will do the primary contextual and OPR validation.
         self.iso_validator = ISO11179Validator()
         self.approved_acronyms = self._load_approved_acronyms()
         self._setup_validation_chain()
-    
+
     def _load_approved_acronyms(self):
         """
         Load approved acronyms from CSV file.
-        
-        Returns:
-            Dict mapping acronyms to definitions
+        This helps in deciding if an acronym is "universally understood" in context.
         """
         approved_acronyms = {}
         try:
-            csv_path = os.path.join("data", "acronyms.csv")
+            # Construct path relative to this file's directory
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            # Navigate up to 'app' then to 'data'
+            csv_path = os.path.join(base_dir, "..", "..", "data", "acronyms.csv")
+            csv_path = os.path.normpath(csv_path) # Normalize path for OS compatibility
+
             if os.path.exists(csv_path):
                 df = pd.read_csv(csv_path)
                 if 'acronym' in df.columns and 'definition' in df.columns:
                     for _, row in df.iterrows():
+                        # Store acronym as uppercase as they are often written that way
                         approved_acronyms[row['acronym'].strip().upper()] = row['definition'].strip()
-                logger.info(f"Loaded {len(approved_acronyms)} approved acronyms from {csv_path}")
+                logger.info(f"ValidatorAgent: Loaded {len(approved_acronyms)} approved acronyms from {csv_path}")
             else:
-                logger.warning(f"Acronyms file not found at {csv_path}")
+                logger.warning(f"ValidatorAgent: Acronyms file not found at {csv_path}.")
         except Exception as e:
-            logger.error(f"Error loading approved acronyms: {e}")
-        
+            logger.error(f"ValidatorAgent: Error loading approved acronyms from {csv_path}: {e}")
         return approved_acronyms
-    
+
     def _format_processes_info(self, data_element: DataElement) -> str:
         """
-        Format the processes information for the prompt.
-        
-        Args:
-            data_element: The data element containing processes
-            
-        Returns:
-            str: Formatted processes information
+        Format related business process information for the LLM prompt.
+        Provides context about how the data element is used.
         """
         if not data_element.processes:
-            return "- Related Processes: None"
+            return "Related Processes: None provided."
         
-        processes_info = "- Related Processes:\n"
+        processes = data_element.processes
+        process_list = []
+        for p_data in processes:
+            if isinstance(p_data, Process):
+                process_list.append(p_data)
+            elif isinstance(p_data, dict):
+                try:
+                    process_list.append(Process(**p_data))
+                except Exception as e:
+                    logger.warning(f"ValidatorAgent: Could not convert dict to Process object: {p_data}. Error: {e}")
+            else:
+                logger.warning(f"ValidatorAgent: Unknown process type encountered: {type(p_data)}")
         
-        for i, process in enumerate(data_element.processes, 1):
-            processes_info += f"  Process {i} ID: {process.process_id}\n"
-            processes_info += f"  Process {i} Name: {process.process_name}\n"
+        if not process_list:
+            return "Related Processes: None available after formatting."
+
+        info = "Related Processes (for contextual understanding):\n"
+        for i, process in enumerate(process_list, 1):
+            info += f"  Process {i} Name: {process.process_name}"
+            if process.process_id: # Include ID if available
+                 info += f" (ID: {process.process_id})"
             if process.process_description:
-                processes_info += f"  Process {i} Description: {process.process_description}\n"
-            processes_info += "\n"
-        
-        return processes_info
-    
+                # Truncate long descriptions for prompt brevity
+                desc_preview = process.process_description[:100] + "..." if len(process.process_description) > 100 else process.process_description
+                info += f", Description: {desc_preview}"
+            info += "\n"
+        return info.strip()
+
     def _setup_validation_chain(self):
-        """Set up the LangChain chain for validation."""
+        """
+        Set up the LangChain prompt and chain for data element validation.
+        The prompt guides the LLM to evaluate based on ISO/IEC 11179 principles,
+        contextual sense, OPR model, and layperson understandability.
+        """
         template = """
-        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to evaluate the 
-        given data element name and description against these standards to determine the quality of the metadata.
-        
-        ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
-        - Names MUST be in lowercase with spaces between words.
-        - Names MUST NOT use technical formatting like camelCase, snake_case or PascalCase
-        - Names MUST NOT contain underscores, hyphens, or special characters
-        - Names should be clear, unambiguous and self-describing
-        - Names should not use acronyms or abbreviations unless they are universally understood
-        - Names should be concise yet descriptive
-        - Names should use standard terminology in the domain
-        - Names should use business language that non-technical users can understand
-        
-        ISO/IEC 11179 standards for data element descriptions:
-        - Descriptions should clearly define what the data element represents
-        - Descriptions should be complete, covering the concept fully
-        - Descriptions should be precise, specific enough to distinguish from other concepts
-        - Descriptions should be objective and factual, not opinion-based
-        - Descriptions should use complete sentences with proper grammar and punctuation
-        - Descriptions should be written in business language, not technical jargon
-        
-        Data Element to Evaluate:
+        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to evaluate the
+        given data element's "Current Name" and "Current Description" for quality, contextual sense, and adherence
+        to the principles of ISO/IEC 11179, particularly focusing on understandability by a general business audience.
+
+        **Key ISO/IEC 11179 Principles for Validation:**
+
+        **Data Element Names:**
+        1.  **Conceptual Structure (Object-Property-Representation - OPR):** A high-quality name should clearly imply:
+            * An **Object Class** (e.g., "Customer", "Product", "Sales Order"). This is the main entity.
+            * A **Property** (e.g., "Identifier", "Name", "Status", "Effective Date", "Net Amount"). This is a characteristic of the object.
+            * Optionally, a **Representation Qualifier** if it adds essential clarity (e.g., "Code", "Text", "Indicator", "Count").
+            The name should naturally convey these components in a business-friendly phrase (e.g., "Customer Full Name", "Product Status Code", "Order Total Amount").
+        2.  **Clarity & Simplicity for Layperson:** The name MUST be easily understandable by a business user who may not be a domain expert. Avoid internal jargon or overly technical terms.
+        3.  **Unambiguity:** The name should have one clear meaning and not be open to multiple interpretations.
+        4.  **Conciseness:** Be as brief as possible while ensuring the meaning is fully conveyed.
+        5.  **Formatting:**
+            * Use consistent, business-readable casing (e.g., "customer name" or "Customer Name" are acceptable; "customerName" or "customer_name" are not).
+            * Avoid special characters (e.g., %, &, *, #, /) unless part of a widely recognized term (very rare). Spaces are used for multi-word names.
+        6.  **Acronyms/Abbreviations:** Should only be used if they are universally understood (e.g., "ID", "URL", "VAT"). If an acronym is present, assess if it meets this high bar for understandability.
+
+        **Data Element Descriptions:**
+        1.  **Clear and Precise Definition:** Must clearly, precisely, and completely define what the data element *is* and what it represents.
+        2.  **Contextual Sense & Layperson Readability:** The description MUST make sense in relation to the name and any provided examples or processes. It must be easily readable and understandable by a general business audience.
+        3.  **Completeness:** Cover the concept fully.
+        4.  **Objectivity:** Be factual and avoid opinions.
+        5.  **Grammar & Structure:** Use complete, grammatically correct sentences. Start with a capital letter and end with appropriate punctuation (usually a period).
+
+        **Data Element to Evaluate:**
         - ID: {id}
         - Current Name: {name}
         - Current Description: {description}
-        - Example (if provided): {example}
+        - Example (if provided for context): {example}
         {processes_info}
-        
-        Here are examples of high-quality data elements that meet ISO/IEC 11179 standards:
-        
-        Example 1:
-        - Original Name: cust_id
-        - Enhanced Name: customer identifier
-        - Original Description: Customer ID in the system
-        - Enhanced Description: A unique alphanumeric code that identifies an individual customer within the organization's systems.
-        - Quality Assessment: GOOD
-        - Reason: The name is in lowercase with spaces, avoids technical terms, and is clear. The description is complete, precise, and explains exactly what the element represents.
-        
-        Example 2:
-        - Original Name: LN
-        - Enhanced Name: last name
-        - Original Description: Last name
-        - Enhanced Description: The legal surname of an individual as it appears on official identification documents.
-        - Quality Assessment: GOOD
-        - Reason: The name is properly expanded and formatted. The description clearly defines what the element represents with sufficient context.
-        
-        Example 3:
-        - Original Name: trans_amt
-        - Enhanced Name: transaction amount
-        - Original Description: The $ amnt of the trans.
-        - Enhanced Description: The monetary value of a transaction expressed in the transaction's currency.
-        - Quality Assessment: GOOD
-        - Reason: The abbreviated name is properly expanded and formatted. The description provides clear context and fixes abbreviations and grammar issues.
-        
-        Based on the ISO/IEC 11179 standards, evaluate the quality of this data element.
-        
-        IMPORTANT: Your response MUST include ALL of the following 6 evaluation points in order:
-        1. Is the name valid according to ISO/IEC 11179 standards? [yes/no]
-        2. Detailed feedback on the name quality (provide specific issues and suggestions)
-        3. Is the description valid according to the standards? [yes/no]
-        4. Detailed feedback on the description quality (pay careful attention to grammar and punctuation)
-        5. Overall quality status - MUST be one of: "GOOD", "NEEDS_IMPROVEMENT", or "POOR"
-        6. List of specific improvements that could be made (be detailed and prescriptive)
-        
-        DO NOT use any special formatting characters like asterisks (**), backticks (``), or markdown syntax.
-        DO NOT include any \\n characters or other special characters in your response.
-        Please be thorough and specific in your feedback, as it will be used to improve the data element.
+
+        **Evaluation Task:**
+        Based on ALL the above ISO/IEC 11179 principles, focusing on the OPR structure for names, contextual sense, and layperson understandability for both name and description:
+        1.  Assess if the "Current Name" effectively implies an Object, Property, (and optionally Representation) and is clear to a layperson.
+        2.  Assess if the "Current Description" is clear, complete, precise, and understandable to a layperson, making contextual sense with the name.
+        3.  Check for adherence to formatting and grammatical rules.
+
+        **Output Format:**
+        Provide your evaluation *strictly* in the following format, with each item on a new line. Do not include any extra formatting, numbering, or markdown:
+        Is name valid: [yes/no - "yes" ONLY if it meets ALL criteria including OPR implication, clarity, simplicity, and layperson understandability]
+        Name feedback: [Detailed feedback. If not valid, explain ALL reasons, including issues with OPR structure, clarity, simplicity, or formatting. If valid, confirm its strengths and how it meets the criteria.]
+        Is description valid: [yes/no - "yes" ONLY if it meets ALL criteria including clarity, completeness, precision, and layperson understandability]
+        Description feedback: [Detailed feedback. If not valid, explain ALL reasons for lack of clarity, completeness, or contextual sense. If valid, confirm its strengths.]
+        Overall quality: [GOOD, NEEDS_IMPROVEMENT, or POOR. GOOD only if BOTH name and description are fully valid AND make excellent contextual sense for a layperson.]
+        Suggested improvements: [List specific, actionable improvements for name and/or description if the "Overall quality" is not GOOD. Focus on achieving OPR, clarity, and simplicity. If GOOD, state "No improvements needed." Each improvement on a new line, starting with "- ". If multiple lines per improvement, indent subsequent lines.]
         """
-        
         self.validation_prompt = PromptTemplate(
             input_variables=["id", "name", "description", "example", "processes_info"],
             template=template)
         self.validation_chain = self.validation_prompt | self.llm | StrOutputParser()
-    
+
     def _perform_basic_validation(self, data_element: DataElement) -> Tuple[List[str], bool, bool]:
         """
-        Perform basic validation checks without using the LLM.
-        
-        Args:
-            data_element: The data element to validate
-            
-        Returns:
-            Tuple containing:
-            - List of validation issues
-            - Whether the name is valid
-            - Whether the description is valid
+        Performs very basic, non-LLM checks. The main validation is done by the LLM.
+        This can provide hints or context if needed but isn't the primary validation method.
         """
-        basic_validation_issues = []
+        name_to_check = data_element.existing_name or ""
+        desc_to_check = data_element.existing_description or ""
         
-        # Validate name
-        name_valid, name_feedback = self.iso_validator.validate_name(data_element.existing_name)
-        if not name_valid:
-            basic_validation_issues.append(f"Name validation failed: {name_feedback}")
+        # Using the util.iso_standards.ISO11179Validator for basic syntax.
+        # Note: The LLM prompt allows for more flexible casing ("customer name" or "Customer Name")
+        # so programmatic checks for strict lowercase might conflict. LLM's contextual evaluation is key.
+        name_valid_prog, name_feedback_prog = self.iso_validator.validate_name(name_to_check)
+        desc_valid_prog, desc_feedback_prog = self.iso_validator.validate_description(desc_to_check)
         
-        # Validate description
-        desc_valid, desc_feedback = self.iso_validator.validate_description(data_element.existing_description)
-        if not desc_valid:
-            basic_validation_issues.append(f"Description validation failed: {desc_feedback}")
-        
-        # Check for acronyms (max 3 characters)
-        words = re.findall(r'\b[A-Z]{2,3}\b', data_element.existing_name + " " + data_element.existing_description)
-        acronym_info = ""
-        
-        if words:
-            approved_acronyms_found = []
-            contextual_acronyms = []
+        basic_issues = []
+        if not name_valid_prog:
+            # Only add if it's a significant structural issue the LLM might miss,
+            # e.g., special characters, not just casing.
+            if not re.match(r"^[a-zA-Z0-9 ]+$", name_to_check.replace(" ", "")): # Check for invalid chars
+                 basic_issues.append(f"Programmatic Name Check (Syntax): {name_feedback_prog}")
+        if not desc_valid_prog:
+            # Only add if it's a significant structural issue.
+            if not desc_to_check.strip() or not desc_to_check.strip()[-1] in ['.','!','?']:
+                basic_issues.append(f"Programmatic Desc Check (Structure): {desc_feedback_prog}")
             
-            for word in words:
-                if word in self.approved_acronyms:
-                    approved_acronyms_found.append(f"{word} ({self.approved_acronyms[word]})")
-                else:
-                    contextual_acronyms.append(word)
-            
-            # Add acronym info to feedback but don't mark invalid
-            if approved_acronyms_found:
-                acronym_info += f"\nFound approved acronyms: {', '.join(approved_acronyms_found)}"
-            if contextual_acronyms:
-                acronym_info += f"\nFound acronyms without context: {', '.join(contextual_acronyms)}"
-            
-            if acronym_info:
-                basic_validation_issues.append(acronym_info)
-        
-        return basic_validation_issues, name_valid, desc_valid
-    
-    def _parse_validation_result(self, result: str) -> ValidationResult:
+        return basic_issues, name_valid_prog, desc_valid_prog
+
+    def _parse_validation_result(self, result_str: str) -> ValidationResult:
         """
-        Parse the validation result from the LLM.
-        
-        Args:
-            result: The LLM output
-            
-        Returns:
-            ValidationResult: Parsed validation result
+        Parses the LLM's string output into a ValidationResult object.
+        Ensures plain text extraction for all fields.
         """
-        # Clean up the result
-        result = result.replace("**", "").replace("```", "")
-        lines = result.strip().split("\n")
+        lines = result_str.strip().split("\n")
         
-        is_name_valid = False
-        is_desc_valid = False
-        name_feedback = ""
-        desc_feedback = ""
-        quality_status = DataQualityStatus.NEEDS_IMPROVEMENT  # Default to NEEDS_IMPROVEMENT instead of POOR
-        improvements = []
-        
-        # Extract each section
-        current_section = None
+        is_name_valid_str = ""
+        name_feedback_str = ""
+        is_desc_valid_str = ""
+        desc_feedback_str = ""
+        quality_status_str = ""
+        improvements_list = []
+
+        # State machine for parsing multi-line feedback/improvements
+        current_parsing_target = None # Can be "name_feedback", "desc_feedback", or "improvements"
+
         for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            if line.startswith("1."):
-                current_section = "name_valid"
-                if "yes" in line.lower():
-                    is_name_valid = True
-            elif line.startswith("2."):
-                current_section = "name_feedback"
-                name_feedback = line[2:].strip()
-            elif line.startswith("3."):
-                current_section = "desc_valid"
-                if "yes" in line.lower():
-                    is_desc_valid = True
-            elif line.startswith("4."):
-                current_section = "desc_feedback"
-                desc_feedback = line[2:].strip()
-            elif line.startswith("5."):
-                current_section = "quality_status"
-                if "GOOD" in line:
-                    quality_status = DataQualityStatus.GOOD
-                elif "NEEDS_IMPROVEMENT" in line or "NEEDS IMPROVEMENT" in line:
-                    quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
-                elif "POOR" in line:
-                    quality_status = DataQualityStatus.POOR
-            elif line.startswith("6."):
-                current_section = "improvements"
-            elif current_section == "name_feedback":
-                name_feedback += " " + line
-            elif current_section == "desc_feedback":
-                desc_feedback += " " + line
-            elif current_section == "improvements":
-                if line.startswith("-") or line.startswith("*") or (line[0].isdigit() and ". " in line):
-                    # This is a new improvement item
-                    line = re.sub(r'^[-*]\s+|\d+\.\s+', '', line)
-                    improvements.append(line)
-                elif improvements:
-                    # This is a continuation of the previous improvement
-                    improvements[-1] += " " + line
-                else:
-                    # If no previous improvement item to append to, create a new one
-                    improvements.append(line)
+            line_content = line.strip()
+            if not line_content: continue # Skip empty lines
+
+            # Check for section headers first
+            if line_content.lower().startswith("is name valid:"):
+                is_name_valid_str = line_content.split(":", 1)[1].strip().lower()
+                current_parsing_target = None
+            elif line_content.lower().startswith("name feedback:"):
+                name_feedback_str = line_content.split(":", 1)[1].strip()
+                current_parsing_target = "name_feedback"
+            elif line_content.lower().startswith("is description valid:"):
+                is_desc_valid_str = line_content.split(":", 1)[1].strip().lower()
+                current_parsing_target = None
+            elif line_content.lower().startswith("description feedback:"):
+                desc_feedback_str = line_content.split(":", 1)[1].strip()
+                current_parsing_target = "desc_feedback"
+            elif line_content.lower().startswith("overall quality:"):
+                quality_status_str = line_content.split(":", 1)[1].strip().upper()
+                current_parsing_target = None
+            elif line_content.lower().startswith("suggested improvements:"):
+                first_improvement = line_content.split(":", 1)[1].strip()
+                # Handle "No improvements needed."
+                if first_improvement and first_improvement.lower() != "no improvements needed.":
+                    improvements_list.append(first_improvement.lstrip("- "))
+                current_parsing_target = "improvements"
+            # If it's not a new section header, append to the current target
+            elif current_parsing_target == "name_feedback":
+                name_feedback_str += " " + line_content
+            elif current_parsing_target == "desc_feedback":
+                desc_feedback_str += " " + line_content
+            elif current_parsing_target == "improvements":
+                # Ensure not to add "No improvements needed." if it's a standalone line after header
+                if line_content and line_content.lower() != "no improvements needed.":
+                    improvements_list.append(line_content.lstrip("- "))
         
-        # Ensure quality status is consistent with validations
-        if is_name_valid and is_desc_valid:
-            # If both are valid but status wasn't explicitly GOOD, use NEEDS_IMPROVEMENT
-            if quality_status == DataQualityStatus.POOR:
-                quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
-        elif not is_name_valid and not is_desc_valid:
-            # If both are invalid, it should be POOR
+        is_name_valid = "yes" in is_name_valid_str
+        is_desc_valid = "yes" in is_desc_valid_str
+
+        quality_status = DataQualityStatus.NEEDS_IMPROVEMENT # Default
+        if quality_status_str == "GOOD":
+            quality_status = DataQualityStatus.GOOD
+        elif quality_status_str == "POOR":
             quality_status = DataQualityStatus.POOR
         
-        # Combine feedback
-        combined_feedback = f"Name feedback: {name_feedback}\n\nDescription feedback: {desc_feedback}"
+        # Consistency check: if LLM says GOOD but marks name/desc as invalid, downgrade.
+        if quality_status == DataQualityStatus.GOOD and (not is_name_valid or not is_desc_valid):
+            quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
+            # Ensure improvements list isn't just "No improvements needed."
+            if not improvements_list or (len(improvements_list)==1 and improvements_list[0].lower() == "no improvements needed."):
+                 improvements_list = ["Review name and description for full compliance as per detailed feedback."]
         
-        # If no improvements were extracted, create some based on validation results
-        if not improvements:
-            if not is_name_valid:
-                improvements.append("Improve the name to comply with ISO/IEC 11179 standards")
-            if not is_desc_valid:
-                improvements.append("Enhance the description to be more precise and complete")
-            if is_name_valid and is_desc_valid and quality_status != DataQualityStatus.GOOD:
-                improvements.append("Further refine name and description for better clarity")
+        # Consolidate feedback strings
+        combined_feedback = f"Name Feedback: {name_feedback_str or 'Not provided.'}\nDescription Feedback: {desc_feedback_str or 'Not provided.'}"
         
+        # Clean up improvements list if it only contains "No improvements needed."
+        if len(improvements_list) == 1 and improvements_list[0].lower() == "no improvements needed.":
+            improvements_list = []
+
         return ValidationResult(
-            is_valid=is_name_valid and is_desc_valid,
-            quality_status=quality_status, 
-            feedback=combined_feedback,
-            suggested_improvements=improvements
+            is_valid=is_name_valid and is_desc_valid, # Overall validity based on LLM's assessment
+            quality_status=quality_status,
+            feedback=combined_feedback.strip(), # Ensure it's plain text
+            suggested_improvements=improvements_list # Ensure it's list of plain strings
         )
-    
-    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
+
+    @cache_manager.async_cached(ttl=3600) # Cache LLM validation results for an hour
     async def validate(self, data_element: DataElement) -> ValidationResult:
         """
-        Validate a data element against ISO/IEC 11179 standards with approved acronyms.
-        
-        Args:
-            data_element: The data element to validate
-            
-        Returns:
-            ValidationResult: The validation result
+        Validates a data element using the LLM based on ISO/IEC 11179, OPR, and clarity.
         """
         try:
-            # First, perform basic validation
-            basic_validation_issues, name_valid, desc_valid = self._perform_basic_validation(data_element)
+            processes_info_str = self._format_processes_info(data_element)
             
-            # Format processes information
-            processes_info = self._format_processes_info(data_element)
-            
-            # Build context information
-            context_info = ""
-            if basic_validation_issues:
-                context_info += "Basic validation issues detected:\n"
-                for issue in basic_validation_issues:
-                    context_info += f"- {issue}\n"
-                context_info += "\nPlease validate both name and description comprehensively regardless.\n\n"
-            
-            # Add the context to the template if we have any
-            template = self.validation_prompt.template
-            if context_info:
-                template = template.replace("Data Element to Evaluate:", 
-                                         f"Additional Context Information:\n{context_info}\nData Element to Evaluate:")
-            
-            # Create a custom prompt for this validation
-            custom_prompt = PromptTemplate(
-                input_variables=["id", "name", "description", "example", "processes_info"],
-                template=template)
-            custom_chain = custom_prompt | self.llm | StrOutputParser()
-            
-            # Perform detailed evaluation
-            result = await custom_chain.ainvoke({
+            # The LLM is expected to do the primary, nuanced validation.
+            # Basic programmatic checks can be logged or used as minor context if needed.
+            # basic_issues, _, _ = self._perform_basic_validation(data_element)
+            # if basic_issues:
+            #    logger.debug(f"Basic programmatic checks for {data_element.id} found: {basic_issues}")
+
+            llm_response_str = await self.validation_chain.ainvoke({
                 "id": data_element.id,
-                "name": data_element.existing_name,
-                "description": data_element.existing_description,
-                "example": data_element.example or "Not provided",
-                "processes_info": processes_info
+                "name": data_element.existing_name or "", # Ensure not None
+                "description": data_element.existing_description or "", # Ensure not None
+                "example": data_element.example or "Not provided.",
+                "processes_info": processes_info_str
             })
             
-            return self._parse_validation_result(result)
+            parsed_result = self._parse_validation_result(llm_response_str)
+
+            # Log if parsing seems to have missed crucial parts, e.g., POOR quality with no improvements
+            if parsed_result.quality_status == DataQualityStatus.POOR and not parsed_result.suggested_improvements:
+                 logger.warning(f"Validation for {data_element.id} resulted in POOR quality with no improvements. Raw LLM: '{llm_response_str[:200]}...', Parsed: {parsed_result.feedback}")
+
+            return parsed_result
+
         except Exception as e:
-            logger.error(f"Error validating data element: {e}")
-            # Return a minimal validation result in case of error
+            logger.error(f"Error validating data element {data_element.id}: {e}", exc_info=True)
+            # Return a clear error state
             return ValidationResult(
                 is_valid=False,
                 quality_status=DataQualityStatus.POOR,
-                feedback=f"Error during validation: {str(e)}",
-                suggested_improvements=["Retry validation after resolving the error"]
+                feedback=f"System error during validation: {str(e)}",
+                suggested_improvements=["A system error occurred. Please review manually or retry the validation."]
             )
-    
+
     async def batch_validate(self, data_elements: List[DataElement]) -> List[ValidationResult]:
         """
-        Validate multiple data elements in parallel.
-        
-        Args:
-            data_elements: List of data elements to validate
-            
-        Returns:
-            List of validation results
+        Validates multiple data elements in parallel.
         """
-        # Create tasks for all validations
         tasks = [self.validate(element) for element in data_elements]
-        
-        # Run all tasks concurrently
         return await asyncio.gather(*tasks)
+

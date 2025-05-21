@@ -1,5 +1,6 @@
 """
 Enhancer Agent - Enhances data elements to meet ISO/IEC 11179 standards.
+Focuses on contextual sense, OPR model, layperson understandability, and enhances only if needed.
 """
 
 import re
@@ -12,509 +13,399 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import AzureChatOpenAI
 from app.core.models import DataElement, EnhancementResult, ValidationResult, DataQualityStatus, Process
-from app.agents.validator_agent import ValidatorAgent
+from app.agents.validator_agent import ValidatorAgent # To get validation feedback
 from app.utils.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 
 class EnhancerAgent:
     """
-    Agent that enhances data elements to meet ISO/IEC 11179 standards.
+    Agent that enhances data elements to meet ISO/IEC 11179 standards,
+    prioritizing contextual meaning, OPR model for names, layperson understandability,
+    and the principle of "enhance only if needed".
     """
-    
+
     def __init__(self, llm: AzureChatOpenAI, acronym_file_path=None):
         """
         Initialize the enhancer agent.
-        
+
         Args:
             llm: Language model instance
-            acronym_file_path: Path to acronym definitions file
+            acronym_file_path: Path to acronym definitions file (optional)
         """
         self.llm = llm
         self.acronyms = self._load_acronyms(acronym_file_path)
         self._setup_enhancement_chain()
-        # Initialize validator agent for quality feedback
+        # Validator agent is used to assess quality of enhanced outputs if needed by the workflow
         self.validator = ValidatorAgent(llm)
-    
+
     def _load_acronyms(self, acronym_file_path=None):
         """
         Load acronyms and their definitions from a CSV file.
-        
-        Args:
-            acronym_file_path: Path to acronym definitions file
-            
-        Returns:
-            Dict mapping acronyms to definitions
+        Used to guide the LLM on expanding acronyms appropriately.
         """
         acronyms = {}
         try:
-            # Use default path if not provided
-            if not acronym_file_path:
-                acronym_file_path = "data/acronyms.csv"
-            
-            # Check if file exists
-            if os.path.exists(acronym_file_path):
-                df = pd.read_csv(acronym_file_path)
-                
-                # Ensure required columns exist
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            default_path = os.path.join(base_dir, "..", "..", "data", "acronyms.csv")
+            actual_path = acronym_file_path if acronym_file_path else default_path
+            actual_path = os.path.normpath(actual_path)
+
+            if os.path.exists(actual_path):
+                df = pd.read_csv(actual_path)
                 if 'acronym' in df.columns and 'definition' in df.columns:
-                    # Group by acronym to handle multiple definitions
-                    for acronym, group in df.groupby('acronym'):
-                        acronyms[acronym.strip().upper()] = group['definition'].tolist()
-                    
-                    logger.info(f"Loaded {len(acronyms)} acronyms from {acronym_file_path}")
-                else:
-                    logger.warning(f"CSV file {acronym_file_path} does not contain required columns 'acronym' and 'definition'")
+                    for _, row in df.iterrows():
+                        # Store one primary definition, assuming CSV is curated for this
+                        acronyms[row['acronym'].strip().upper()] = row['definition'].strip()
+                logger.info(f"EnhancerAgent: Loaded {len(acronyms)} acronym definitions from {actual_path}")
             else:
-                logger.warning(f"Acronym file not found at {acronym_file_path}")
+                logger.warning(f"EnhancerAgent: Acronyms file not found at {actual_path}.")
         except Exception as e:
-            logger.error(f"Error loading acronyms: {e}")
-        
+            logger.error(f"EnhancerAgent: Error loading acronyms from {actual_path}: {e}")
         return acronyms
-    
+
     def _setup_enhancement_chain(self):
-        """Set up the LangChain chain for enhancement."""
+        """
+        Set up the LangChain prompt and chain for data element enhancement.
+        The prompt emphasizes OPR, clarity, layperson understandability, and "enhance only if needed".
+        """
         template = """
-        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to enhance the 
-        given data element name and description to meet these standards and represent high-quality metadata.
-        
-        ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
-        - Names MUST be in lowercase with spaces between words.
-        - Names MUST NOT use technical formatting like camelCase, snake_case or PascalCase
-        - Names MUST NOT contain underscores, hyphens, or special characters
-        - Names should be clear, unambiguous and self-describing
-        - Names should not use acronyms or abbreviations unless they are universally understood
-        - Names should be concise yet descriptive
-        - Names should use standard terminology in the domain
-        - Names should use business language that non-technical users can understand
-        
-        ISO/IEC 11179 standards for data element descriptions:
-        - Descriptions should clearly define what the data element represents
-        - Descriptions should be complete, covering the concept fully
-        - Descriptions should be precise, specific enough to distinguish from other concepts
-        - Descriptions should be objective and factual, not opinion-based
-        - Descriptions should use complete sentences with proper grammar and punctuation
-        - Descriptions should be written in business language, not technical jargon
-        
-        Data Element to Enhance:
+        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to enhance the
+        given data element's "Current Name" and "Current Description" to meet these standards.
+        The primary goals are:
+        1.  **Contextual Sense & Layperson Understandability:** The name and description must be crystal clear to a general business user.
+        2.  **Object-Property-Representation (OPR) Model for Names:** Names should clearly imply an Object Class, a Property, and optionally a Representation Qualifier.
+        3.  **Enhance Only If Needed:** If the current name and description already meet these high standards, do not change them.
+
+        **Key ISO/IEC 11179 Principles for Enhancement:**
+
+        **Data Element Names:**
+        * **OPR Structure:** Clearly identify an **Object Class** (e.g., "Customer", "Product"), a **Property** (e.g., "Identifier", "Name", "Status"), and optionally a **Representation Qualifier** (e.g., "Code", "Text"). Formulate a business-friendly name reflecting this (e.g., "Customer Full Name", "Product Status Code").
+        * **Clarity & Simplicity:** Must be easily understood by a non-domain expert. Use simple, direct language.
+        * **Formatting:** Prefer consistent, readable casing (e.g., "customer full name" or "Customer Full Name"). Avoid camelCase/snake_case. Use spaces for multi-word names. No special characters (except spaces).
+        * **Acronyms:** Expand unless universally known (e.g., ID, URL). Use "Acronym Information" below if provided.
+
+        **Data Element Descriptions:**
+        * **Clear, Precise, Complete Definition:** Define what the data element *is*.
+        * **Layperson Readability & Context:** Must make sense with the name and be easily understood. Use full sentences, proper grammar, start with a capital, end with a period.
+        * **Objectivity:** Factual and unambiguous.
+
+        **Data Element to Potentially Enhance:**
         - ID: {id}
         - Current Name: {name}
         - Current Description: {description}
-        - Example (if provided): {example}
+        - Example (for context): {example}
         {processes_info}
-        
-        Additional Context:
-        {additional_context}
-        
-        Validation Feedback:
+
+        **Validation Feedback on Current Element (consider this carefully):**
         {validation_feedback}
-        
-        Acronym Information:
+
+        **Acronym Information (use to expand acronyms in current name/description if enhancement is needed):**
         {acronym_info}
-        
-        Here are examples of high-quality data elements that meet ISO/IEC 11179 standards:
-        
-        Example 1:
-        - Original Name: cust_id
-        - Enhanced Name: customer identifier
-        - Original Description: Customer ID in the system
-        - Enhanced Description: A unique alphanumeric code that identifies an individual customer within the organization's systems.
-        - Quality Assessment: GOOD
-        
-        Example 2:
-        - Original Name: LN
-        - Enhanced Name: last name
-        - Original Description: Last name
-        - Enhanced Description: The legal surname of an individual as it appears on official identification documents.
-        - Quality Assessment: GOOD
-        
-        Example 3:
-        - Original Name: trans_amt
-        - Enhanced Name: transaction amount
-        - Original Description: The $ amnt of the trans.
-        - Enhanced Description: The monetary value of a transaction expressed in the transaction's currency.
-        - Quality Assessment: GOOD
-        
-        Example 4:
-        - Original Name: DOB
-        - Enhanced Name: date of birth
-        - Original Description: DOB of customer
-        - Enhanced Description: The calendar date on which an individual person was born, typically stored in a standardized date format.
-        - Quality Assessment: GOOD
-        
-        Example 5:
-        - Original Name: acct_bal
-        - Enhanced Name: account balance
-        - Original Description: Current bal. in the account
-        - Enhanced Description: The current monetary value held in an account, calculated as the sum of all deposits minus all withdrawals and fees.
-        - Quality Assessment: GOOD
-        
-        Based on the ISO/IEC 11179 standards, the validation feedback, the acronym information, and the examples, enhance this data element.
-        
-        - Expand acronyms and abbreviations according to the provided acronym definitions, choosing the most contextually appropriate expansion.
-        - If acronyms are encountered that aren't in the provided list, expand them if you know their meaning.
-        - Only keep very well-known acronyms (like PDF, URL, ID) that are universally understood.
-        - For descriptions, ensure they are complete sentences with proper grammar and explain the concept fully.
-        - Make sure the enhanced element would receive a "GOOD" quality assessment.
-        
-        Provide your enhancement as follows:
-        1. Enhanced Name: [provide the improved name - MUST be in lowercase with spaces between words]
-        2. Enhanced Description: [provide the improved description]
-        3. Enhancement Notes: [explain the changes made and how they improve the compliance with standards]
-        4. Confidence Score (0.0-1.0): [provide a confidence score for the enhancement]
-        
-        IMPORTANT: Do not use any special formatting like asterisks (**) or other markdown formatting in your response.
-        
-        Make the enhancement business-friendly and ensure they make sense in a business context.
-        The names should be simple enough for business users to understand without being technical.
-        Use the example and process information provided to add context to your enhancements.
+
+        **CRITICAL INSTRUCTION: "Enhance Only If Needed"**
+        First, thoroughly evaluate if the "Current Name" and "Current Description" ALREADY meet ALL the above standards (OPR structure, clarity for layperson, formatting, description quality).
+        * IF YES (they are already excellent and compliant):
+            * "Enhanced Name" MUST be identical to "Current Name".
+            * "Enhanced Description" MUST be identical to "Current Description".
+            * For "Enhancement Notes", state: "Original name and description meet quality standards and are contextually sound; no changes were necessary."
+            * "Confidence Score" should be high (e.g., 0.95 or 1.0).
+        * IF NO (enhancement is needed to meet the standards):
+            * Create an "Enhanced Name" that fully adheres to the OPR model and other name standards.
+            * Create an "Enhanced Description" that is clear, complete, and adheres to all description standards.
+            * Expand acronyms appropriately.
+            * Explain the changes in "Enhancement Notes".
+            * Provide an appropriate "Confidence Score".
+
+        **Output Format:**
+        Provide your response *strictly* in the following format, with each item on a new line. Do not include any extra formatting, numbering, or markdown:
+        Enhanced Name: [Provide the enhanced name as plain text here, or the original if no changes were needed]
+        Enhanced Description: [Provide the enhanced description as plain text here, or the original if no changes. Must start with a capital and end with a period.]
+        Enhancement Notes: [Explain the changes made (what, why, how it improves) OR specifically state why no changes were made if original was compliant.]
+        Confidence Score (0.0-1.0): [Provide a numerical confidence score for your enhancement or assessment of original quality.]
         """
-        
         self.enhancement_prompt = PromptTemplate(
             input_variables=[
-                "id", "name", "description", "example", "processes_info", 
-                "validation_feedback", "acronym_info", "additional_context"
+                "id", "name", "description", "example", "processes_info",
+                "validation_feedback", "acronym_info"
             ],
             template=template)
         self.enhancement_chain = self.enhancement_prompt | self.llm | StrOutputParser()
-    
+
     def _prepare_acronym_info(self, data_element: DataElement) -> str:
         """
-        Prepare acronym information for the prompt based on detected acronyms in the data element.
-        
-        Args:
-            data_element: The data element to analyze for acronyms
-            
-        Returns:
-            str: Formatted acronym information
+        Prepares a string with relevant acronym expansions for the LLM prompt.
         """
-        # Extract potential acronyms from name and description
-        name = data_element.existing_name
-        description = data_element.existing_description
+        name = data_element.existing_name or ""
+        desc = data_element.existing_description or ""
+        # Regex to find potential acronyms: 2-5 uppercase letters, possibly followed by 's' or 'S'
+        # and ensuring they are whole words (bounded by non-alphanumeric or start/end of string)
+        potential_acronyms_in_text = set(re.findall(r'\b[A-Z][A-Z0-9]{1,4}(?:[sS])?\b', name + " " + desc))
         
-        # Simple regex to find uppercase words that might be acronyms (2+ characters)
-        potential_acronyms = set(re.findall(r'\b[A-Z]{2,}\b', name + " " + description))
-        
-        if not potential_acronyms and not self.acronyms:
-            return "No acronyms detected or provided."
-        
-        # Prepare information about found acronyms
-        acronym_info = "Known acronyms in this context:\n"
-        
-        found_in_element = False
-        for acronym in potential_acronyms:
-            if acronym in self.acronyms:
-                definitions = self.acronyms[acronym]
-                found_in_element = True
-                if len(definitions) == 1:
-                    acronym_info += f"- {acronym}: {definitions[0]}\n"
+        # Filter out universally accepted acronyms that don't need expansion
+        common_exceptions = {"ID", "URL", "SKU", "API", "KPI", "VAT", "ETA", "PDF", "SQL"}
+        acronyms_to_check = potential_acronyms_in_text - common_exceptions
+
+        if not self.acronyms and not acronyms_to_check:
+            return "No specific acronym information. Expand any non-universal acronyms based on common business understanding."
+
+        info_parts = []
+        if acronyms_to_check:
+            info_parts.append("Consider expanding the following detected potential acronyms if they are not universally understood in this context:")
+            for acronym_in_text in sorted(list(acronyms_to_check)): # Sort for consistent prompt
+                if acronym_in_text in self.acronyms:
+                    info_parts.append(f"- '{acronym_in_text}' (Known expansion: '{self.acronyms[acronym_in_text]}')")
                 else:
-                    acronym_info += f"- {acronym}: Multiple definitions available:\n"
-                    for i, definition in enumerate(definitions, 1):
-                        acronym_info += f"  {i}. {definition}\n"
+                    info_parts.append(f"- '{acronym_in_text}' (Definition not in provided list; expand if meaning is not obvious).")
         
-        # Add a sample of other acronyms from our dictionary that might be relevant
-        # (limit to 10 to avoid overwhelming the prompt)
-        other_acronyms = [acronym for acronym in self.acronyms if acronym not in potential_acronyms]
-        if other_acronyms:
-            sample_size = min(10, len(other_acronyms))
-            sample_acronyms = other_acronyms[:sample_size]
-            
-            acronym_info += "\nSample of other known acronyms in the domain:\n"
-            for acronym in sample_acronyms:
-                definitions = self.acronyms[acronym]
-                if len(definitions) == 1:
-                    acronym_info += f"- {acronym}: {definitions[0]}\n"
-                else:
-                    acronym_info += f"- {acronym}: Multiple definitions available\n"
-            
-            if len(other_acronyms) > sample_size:
-                acronym_info += f"(Plus {len(other_acronyms) - sample_size} more acronyms in the database)\n"
-        elif not found_in_element:
-            return "No known acronyms detected in this data element."
-        
-        acronym_info += "\nInstructions for acronym handling:\n"
-        acronym_info += "- Expand acronyms in both name and description unless they are universally understood (like URL, PDF)\n"
-        acronym_info += "- Choose the most contextually appropriate expansion when multiple definitions are available\n"
-        acronym_info += "- If you know the meaning of acronyms not listed above, expand those as well\n"
-        
-        return acronym_info
-    
+        if not info_parts: # If all detected acronyms were common exceptions
+            return "Detected acronyms appear to be universally understood. Ensure any other less common acronyms are expanded."
+
+        return "Relevant Acronym Information to Guide Expansion:\n" + "\n".join(info_parts) + "\nGeneral Rule: Expand all acronyms for clarity unless they are as common as 'ID' or 'URL'."
+
     def _format_processes_info(self, data_element: DataElement) -> str:
         """
-        Format the processes information for the prompt.
-        
-        Args:
-            data_element: The data element containing processes
-            
-        Returns:
-            str: Formatted processes information
+        Formats related business process information for the LLM prompt.
         """
         if not data_element.processes:
-            return "- Related Processes: None"
+            return "Related Processes: None provided."
         
         processes = data_element.processes
-        # Ensure processes are Process objects
-        if not all(isinstance(p, Process) for p in processes):
-            # Try to convert dictionaries to Process objects
-            processes = []
-            for p in data_element.processes:
-                if isinstance(p, Process):
-                    processes.append(p)
-                elif isinstance(p, dict):
-                    processes.append(Process(**p))
-                else:
-                    logger.warning(f"Unknown process type: {type(p)}")
+        process_list = []
+        for p_data in processes:
+            if isinstance(p_data, Process): process_list.append(p_data)
+            elif isinstance(p_data, dict):
+                try: process_list.append(Process(**p_data))
+                except Exception as e: logger.warning(f"EnhancerAgent: Could not convert dict to Process: {p_data}. Error: {e}")
+            else: logger.warning(f"EnhancerAgent: Unknown process type: {type(p_data)}")
         
-        processes_info = "- Related Processes:\n"
-        
-        for i, process in enumerate(processes, 1):
-            processes_info += f"  Process {i} ID: {process.process_id}\n"
-            processes_info += f"  Process {i} Name: {process.process_name}\n"
+        if not process_list: return "Related Processes: None available after formatting."
+
+        info = "Related Processes (for contextual understanding of the data element's use):\n"
+        for i, process in enumerate(process_list, 1):
+            info += f"  Process {i} Name: {process.process_name}"
+            if process.process_id: info += f" (ID: {process.process_id})"
             if process.process_description:
-                processes_info += f"  Process {i} Description: {process.process_description}\n"
-            processes_info += "\n"
-        
-        return processes_info
-    
-    def _parse_enhancement_result(self, result: str)->EnhancementResult:
+                desc_preview = process.process_description[:100] + "..." if len(process.process_description) > 100 else process.process_description
+                info += f", Description: {desc_preview}"
+            info += "\n"
+        return info.strip()
+
+    def _parse_enhancement_result(self, result_str: str) -> EnhancementResult:
         """
-        Parse the enhancement result from the LLM.
-        
-        Args:
-            result: The LLM output
-            
-        Returns:
-            EnhancementResult: Parsed enhancement result
+        Parses the LLM's string output into an EnhancementResult object.
+        Ensures plain text extraction and applies basic formatting rules to description.
         """
         enhanced_name = ""
         enhanced_description = ""
-        feedback = ""
-        confidence = 0.7  # Default confidence
+        feedback_notes = "" # For "Enhancement Notes"
+        confidence_score_str = "0.5" # Default confidence
         
-        # Clean up result by removing any markdown or special characters
-        result = result.replace("**", "").strip()
+        current_parsing_target = None
+
+        for line in result_str.strip().split("\n"):
+            line_content = line.strip()
+            if not line_content: continue
+
+            if line_content.startswith("Enhanced Name:"):
+                enhanced_name = line_content.replace("Enhanced Name:", "").strip()
+                # Clean potential list markers or other LLM artifacts
+                enhanced_name = re.sub(r"^\s*[\d\W.-]*\s*", "", enhanced_name).strip()
+                current_parsing_target = None
+            elif line_content.startswith("Enhanced Description:"):
+                enhanced_description = line_content.replace("Enhanced Description:", "").strip()
+                enhanced_description = re.sub(r"^\s*[\d\W.-]*\s*", "", enhanced_description).strip()
+                current_parsing_target = "description"
+            elif line_content.startswith("Enhancement Notes:"):
+                feedback_notes = line_content.replace("Enhancement Notes:", "").strip()
+                current_parsing_target = "notes"
+            elif line_content.startswith("Confidence Score:"):
+                confidence_score_str = line_content.replace("Confidence Score:", "").strip()
+                current_parsing_target = None
+            elif current_parsing_target == "description":
+                enhanced_description += " " + line_content
+            elif current_parsing_target == "notes":
+                feedback_notes += " " + line_content
         
-        lines = result.strip().split("\n")
-        for line in lines:
-            if "Enhanced Name:" in line:
-                enhanced_name = line.split("Enhanced Name:")[1].strip()
-                # Remove any quotes if present
-                enhanced_name = enhanced_name.strip('"\'[]')
-                break
+        # Final cleaning and formatting for description
+        if enhanced_description:
+            enhanced_description = enhanced_description.strip()
+            if enhanced_description: # Ensure not empty after strip
+                enhanced_description = enhanced_description[0].upper() + enhanced_description[1:]
+                if not enhanced_description.endswith(('.', '!', '?')):
+                    enhanced_description += "."
         
-        description_start = None
-        description_end = None
-        
-        for i, line in enumerate(lines):
-            if "Enhanced Description:" in line:
-                description_start = i
-            elif description_start is not None and "Enhancement Notes:" in line:
-                description_end = i
-                break
-        
-        if description_start is not None:
-            if description_end is not None:
-                description_lines = lines[description_start:description_end]
+        confidence = 0.5 # Default
+        try:
+            # Try to find a float like "0.9" or "1.0"
+            confidence_match = re.search(r"(\b\d\.\d+\b|\b[01]\b)", confidence_score_str) # Matches 0.X, 1.0, 0, 1
+            if confidence_match:
+                confidence = float(confidence_match.group(1))
+                confidence = max(0.0, min(1.0, confidence)) # Clamp to 0.0-1.0
             else:
-                description_lines = lines[description_start:]
+                logger.warning(f"EnhancerAgent: Could not parse float from confidence score string: '{confidence_score_str}'")
+        except ValueError:
+            logger.warning(f"EnhancerAgent: ValueError parsing confidence score from: '{confidence_score_str}'")
+
+        # Fallbacks if parsing completely failed for critical fields
+        if not enhanced_name:
+            logger.warning("EnhancerAgent: Parsing failed to extract Enhanced Name.")
+            enhanced_name = "parsing_error_name" # Placeholder to indicate error
+        if not enhanced_description:
+            logger.warning("EnhancerAgent: Parsing failed to extract Enhanced Description.")
+            enhanced_description = "Parsing error: Enhanced description could not be extracted." # Placeholder
             
-            for i, line in enumerate(description_lines):
-                if "Enhanced Description:" in line:
-                    enhanced_description = line.split("Enhanced Description:")[1].strip()
-                    enhanced_description += " " + " ".join([l.strip() for l in description_lines[i+1:]])
-            
-            # Remove any quotes or brackets if present
-            enhanced_description = enhanced_description.strip('"\'[]')
-        
-        notes_start = None
-        notes_end = None
-        for i, line in enumerate(lines):
-            if "Enhancement Notes:" in line:
-                notes_start = i
-            elif notes_start is not None and "Confidence Score" in line:
-                notes_end = i
-                break
-        
-        if notes_start is not None:
-            if notes_end is not None:
-                feedback_lines = lines[notes_start:notes_end]
-            else:
-                feedback_lines = lines[notes_start:]
-            
-            for i, line in enumerate(feedback_lines):
-                if "Enhancement Notes:" in line:
-                    feedback = line.split("Enhancement Notes:")[1].strip()
-                    feedback += " " + " ".join([l.strip() for l in feedback_lines[i+1:]])
-        
-        for line in lines:
-            if "Confidence Score" in line:
-                match = re.search(r"(\d+\.\d+)", line)
-                if match:
-                    try:
-                        confidence = float(match.group(1))
-                    except ValueError:
-                        logger.warning(f"Failed to parse confidence score from: {line}")
-                        pass
-        
-        # Ensure confidence is within bounds
-        confidence = max(0.0, min(1.0, confidence))
-        
         return EnhancementResult(
             enhanced_name=enhanced_name,
             enhanced_description=enhanced_description,
-            feedback=feedback,
+            feedback=feedback_notes.strip(), # This is "Enhancement Notes"
             confidence=confidence
         )
-    
-    async def validate_enhanced_element(self, data_element: DataElement) -> ValidationResult:
+
+    async def validate_enhanced_element(self, data_element_for_validation: DataElement) -> ValidationResult:
         """
-        Validate an enhanced data element to check its quality.
-        
+        Validates a data element (typically one that has just been enhanced).
+        The DataElement passed here should have its `existing_name` and `existing_description`
+        set to the *enhanced* values that need validation.
+        """
+        return await self.validator.validate(data_element_for_validation)
+
+    @cache_manager.async_cached(ttl=3600) # Cache results of this iterative process
+    async def enhance_until_quality(self, 
+                                  data_element: DataElement, # The original DataElement
+                                  validation_feedback: str = "", # Initial feedback if any
+                                  max_iterations: int = 1) -> Tuple[EnhancementResult, ValidationResult]:
+        """
+        Iteratively enhances a data element until it's deemed GOOD quality by the validator,
+        or max_iterations are reached. Implements "enhance only if needed".
+
         Args:
-            data_element: The enhanced data element to validate
-            
+            data_element: The original data element to enhance.
+            validation_feedback: Initial validation feedback on the original element.
+            max_iterations: Max enhancement attempts by this method. (Note: LLM might do internal "iterations" too)
+
         Returns:
-            ValidationResult: Validation feedback and quality assessment
+            A tuple containing the final EnhancementResult and the ValidationResult of that final enhancement.
         """
-        # Use validator agent to check quality
-        return await self.validator.validate(data_element)
-    
-    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
-    async def enhance_until_quality(self, data_element: DataElement, 
-                                  validation_feedback: str = "", 
-                                  additional_context: str = "",
-                                  max_iterations: int = 3) -> Tuple[EnhancementResult, ValidationResult]:
-        """
-        Enhance a data element repeatedly until quality is good or max iterations reached.
-        
-        Args:
-            data_element: The data element to enhance
-            validation_feedback: Initial validation feedback
-            additional_context: Additional context to help enhancement
-            max_iterations: Maximum number of enhancement iterations
-            
-        Returns:
-            Tuple[EnhancementResult, ValidationResult]: The final enhanced result and validation
-        """
-        current_element = data_element
-        current_feedback = validation_feedback
-        iteration = 0
-        last_enhancement = None
-        last_validation = None
-        
-        # Enhancement loop
-        while iteration < max_iterations:
-            iteration += 1
-            logger.info(f"Enhancement iteration {iteration} for element: {current_element.id}")
-            
-            # Run enhancement and validation concurrently for better performance
-            enhancement_task = asyncio.create_task(self.enhance(current_element, current_feedback, additional_context))
-            
-            # Get current enhancement
-            enhancement_result = await enhancement_task
-            
-            # Create a test element with the enhanced data
-            test_element = DataElement(
-                id=current_element.id,
-                existing_name=enhancement_result.enhanced_name,
-                existing_description=enhancement_result.enhanced_description,
-                example=current_element.example,
-                processes=current_element.processes,
-                cdm=current_element.cdm
+        current_element_to_enhance = data_element # Start with the original
+        feedback_for_llm = validation_feedback # Initial feedback for the first LLM call
+
+        final_enhancement_attempt = None
+        final_validation_of_attempt = None
+
+        for i in range(max_iterations):
+            iteration_num = i + 1
+            logger.info(f"EnhancerAgent.enhance_until_quality: Iteration {iteration_num}/{max_iterations} for element ID: {data_element.id}, Current Name: '{current_element_to_enhance.existing_name}'")
+
+            # Call the core enhancement logic (which itself might be one LLM call)
+            # This `enhance` call gets the current version of the element and feedback.
+            current_enhancement_result = await self.enhance(
+                current_element_to_enhance, 
+                feedback_for_llm
             )
+            final_enhancement_attempt = current_enhancement_result # Store this as the latest attempt
+
+            # If the enhancer decided not to change (due to "Enhance Only If Needed"),
+            # its output name/desc will be same as current_element_to_enhance's input.
+            # We still need to validate this version.
+            element_version_after_enhancement_logic = DataElement(
+                id=data_element.id,
+                existing_name=current_enhancement_result.enhanced_name, # Key: use the name from LLM's "Enhanced Name" field
+                existing_description=current_enhancement_result.enhanced_description, # Key: use the desc from LLM's "Enhanced Description"
+                example=data_element.example,
+                processes=data_element.processes,
+                cdm=data_element.cdm
+            )
+
+            # Validate the output of the enhancement logic
+            validation_of_this_enhancement = await self.validate_enhanced_element(element_version_after_enhancement_logic)
+            final_validation_of_attempt = validation_of_this_enhancement
+
+            if validation_of_this_enhancement.quality_status == DataQualityStatus.GOOD:
+                logger.info(f"EnhancerAgent: Element {data_element.id} reached GOOD quality after iteration {iteration_num}.")
+                # If no changes were made by LLM and it's GOOD, this means original was good.
+                if (current_enhancement_result.enhanced_name == current_element_to_enhance.existing_name and
+                    current_enhancement_result.enhanced_description == current_element_to_enhance.existing_description):
+                    final_enhancement_attempt.feedback = "Original name and description met quality standards; no changes were made by the enhancement logic."
+                    final_enhancement_attempt.confidence = max(final_enhancement_attempt.confidence, 0.95)
+                break # Exit loop, quality is GOOD
+
+            # Prepare for next iteration (if any)
+            # The element to enhance next time is the *output* of the current enhancement attempt.
+            current_element_to_enhance = element_version_after_enhancement_logic
+            feedback_for_llm = "Feedback on previous enhancement attempt (Quality: {}):\n{}".format(
+                validation_of_this_enhancement.quality_status.value,
+                validation_of_this_enhancement.feedback
+            )
+            if validation_of_this_enhancement.suggested_improvements:
+                feedback_for_llm += "\nFurther suggestions for this attempt:\n- " + "\n- ".join(validation_of_this_enhancement.suggested_improvements)
             
-            # Validate the enhanced element
-            validation_result = await self.validate_enhanced_element(test_element)
+            logger.info(f"EnhancerAgent: Iteration {iteration_num} for {data_element.id} did not achieve GOOD. Quality of attempt: {validation_of_this_enhancement.quality_status.value}.")
+
+        else: # Loop completed all iterations without break
+            logger.warning(f"EnhancerAgent: Max iterations ({max_iterations}) reached for {data_element.id}. Final quality of last attempt: {final_validation_of_attempt.quality_status.value if final_validation_of_attempt else 'N/A'}")
+
+        # Ensure we return valid objects even if loop didn't run or broke early
+        if final_enhancement_attempt is None: # Should only happen if max_iterations = 0
+            final_enhancement_attempt = EnhancementResult(
+                enhanced_name=data_element.existing_name, 
+                enhanced_description=data_element.existing_description,
+                feedback="No enhancement iterations were performed.",
+                confidence=0.1 # Low confidence as no work was done
+            )
+        if final_validation_of_attempt is None: # If loop didn't run, validate the original
+             # This creates a DataElement with original name/desc in "existing" fields for validation
+            final_validation_of_attempt = await self.validate_enhanced_element(data_element)
             
-            # Save the current state
-            last_enhancement = enhancement_result
-            last_validation = validation_result
-            
-            # If quality is good, we're done
-            if validation_result.quality_status == DataQualityStatus.GOOD:
-                logger.info(f"Enhancement reached GOOD quality after {iteration} iterations")
-                break
-                
-            # Otherwise, prepare for next iteration
-            # Use the enhanced element as the new input
-            current_element = test_element
-            
-            # Set feedback for next iteration
-            current_feedback = validation_result.feedback
-            if validation_result.suggested_improvements:
-                current_feedback += "\n\nSuggested improvements:\n" + "\n".join(
-                    f"- {improvement}" for improvement in validation_result.suggested_improvements
-                )
-        
-        if iteration >= max_iterations and last_validation.quality_status != DataQualityStatus.GOOD:
-            logger.warning(f"Reached maximum iterations ({max_iterations}) without achieving GOOD quality")
-            
-        return last_enhancement, last_validation
-    
-    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
-    async def enhance(self, data_element: DataElement, validation_feedback: str = "", additional_context: str = "") -> EnhancementResult:
+        return final_enhancement_attempt, final_validation_of_attempt
+
+    @cache_manager.async_cached(ttl=3600) # Cache individual enhance calls
+    async def enhance(self, data_element: DataElement, validation_feedback: str = "") -> EnhancementResult:
         """
-        Enhance a data element based on validation feedback and additional context.
-        
-        Args:
-            data_element: The data element to enhance
-            validation_feedback: Feedback from validation process
-            additional_context: Additional contextual information to help enhancement
-            
-        Returns:
-            EnhancementResult: The enhanced data element
+        Performs a single enhancement attempt on the data element using the LLM.
+        This is the core call to the LLM for enhancement.
         """
         try:
-            # Prepare acronym information
-            acronym_info = self._prepare_acronym_info(data_element)
-            
-            # Format processes information
-            processes_info = self._format_processes_info(data_element)
-            
-            result = await self.enhancement_chain.ainvoke({
+            acronym_info_str = self._prepare_acronym_info(data_element)
+            processes_info_str = self._format_processes_info(data_element)
+
+            llm_response_str = await self.enhancement_chain.ainvoke({
                 "id": data_element.id,
-                "name": data_element.existing_name,
-                "description": data_element.existing_description,
-                "example": data_element.example or "Not provided",
-                "processes_info": processes_info,
-                "validation_feedback": validation_feedback,
-                "acronym_info": acronym_info,
-                "additional_context": additional_context
+                "name": data_element.existing_name or "", # Current name to be enhanced
+                "description": data_element.existing_description or "", # Current desc to be enhanced
+                "example": data_element.example or "Not provided.",
+                "processes_info": processes_info_str,
+                "validation_feedback": validation_feedback or "No specific prior validation feedback for this attempt. Evaluate current name/description from scratch.",
+                "acronym_info": acronym_info_str,
             })
             
-            enhancement_result = self._parse_enhancement_result(result)
+            enhancement_result = self._parse_enhancement_result(llm_response_str)
             
-            # Log enhancement result for debugging
-            logger.info(f"Enhanced name: {enhancement_result.enhanced_name}")
-            logger.info(f"Enhanced description: {enhancement_result.enhanced_description}")
-            logger.info(f"Confidence: {enhancement_result.confidence}")
+            logger.debug(f"EnhancerAgent.enhance (single LLM call) for {data_element.id}: Name='{enhancement_result.enhanced_name}', Desc='{enhancement_result.enhanced_description[:50]}...', Conf={enhancement_result.confidence:.2f}")
             
+            # Check if parsing failed significantly, log and provide fallback
+            if enhancement_result.enhanced_name == "parsing_error_name" or enhancement_result.enhanced_description.startswith("Parsing error:"):
+                 logger.warning(f"EnhancerAgent: Parsing of LLM output failed for element {data_element.id}. Raw LLM: '{llm_response_str[:200]}...'")
+                 # Fallback to original if enhancement is clearly broken
+                 enhancement_result.enhanced_name = data_element.existing_name if enhancement_result.enhanced_name == "parsing_error_name" else enhancement_result.enhanced_name
+                 if enhancement_result.enhanced_description.startswith("Parsing error:"):
+                    enhancement_result.enhanced_description = data_element.existing_description
+                 enhancement_result.feedback += " Warning: LLM output parsing may have failed. Result reflects original or partially parsed data."
+                 enhancement_result.confidence = 0.1 # Low confidence if parsing failed
             return enhancement_result
         except Exception as e:
-            logger.error(f"Error enhancing data element: {e}")
-            # Return minimal enhancement in case of error
+            logger.error(f"Error in EnhancerAgent.enhance for data element {data_element.id}: {e}", exc_info=True)
+            # Return original data with error feedback in case of system error
             return EnhancementResult(
-                enhanced_name=data_element.existing_name,
-                enhanced_description=data_element.existing_description,
-                feedback=f"Error during enhancement: {str(e)}",
+                enhanced_name=data_element.existing_name or "error_name", 
+                enhanced_description=data_element.existing_description or "Error in enhancement.",
+                feedback=f"System error during enhancement: {str(e)}",
                 confidence=0.0
             )
-    
-    async def batch_enhance(self, data_elements: List[DataElement], validation_feedback: str = "", additional_context: str = "") -> List[EnhancementResult]:
+
+    async def batch_enhance(self, data_elements: List[DataElement], validation_feedback: str = "") -> List[EnhancementResult]:
         """
-        Enhance multiple data elements in parallel.
-        
-        Args:
-            data_elements: List of data elements to enhance
-            validation_feedback: Feedback from validation process
-            additional_context: Additional contextual information
-            
-        Returns:
-            List of enhancement results
+        Enhances multiple data elements in parallel (each undergoing a single enhancement attempt).
         """
-        # Create tasks for all enhancements
-        tasks = [self.enhance(element, validation_feedback, additional_context) for element in data_elements]
-        
-        # Run all tasks concurrently
+        tasks = [self.enhance(element, validation_feedback) for element in data_elements]
         return await asyncio.gather(*tasks)
