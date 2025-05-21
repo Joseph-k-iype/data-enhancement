@@ -1,6 +1,6 @@
 """
-Improved workflow that combines validation and enhancement in fewer LLM calls.
-Replace app/agents/workflow.py with this optimized version.
+Fixed workflow implementation with error handling and proper method access.
+Replace app/agents/workflow.py with this implementation.
 """
 
 import logging
@@ -22,6 +22,7 @@ from app.core.models import (
     Process
 )
 from app.utils.cache import cache_manager
+from app.agents.validator_agent import ValidatorAgent
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +43,10 @@ class OptimizedDataEnhancementWorkflow:
     
     def __init__(self, llm: AzureChatOpenAI):
         self.llm = llm
-        self.graph = self._build_graph()
+        # Add ValidatorAgent instance for direct validation
+        self.validator = ValidatorAgent(llm)
         
-        # Set up the single-call prompt for both validation and enhancement
+        # Set up the improved single-call prompt with better instructions
         self.combined_prompt = PromptTemplate(
             input_variables=["id", "name", "description", "example", "processes_info"],
             template="""
@@ -53,11 +55,11 @@ class OptimizedDataEnhancementWorkflow:
             2. ENHANCE the data element to meet these standards
             
             ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
-            - Names MUST be in lowercase with spaces between words.
+            - Names MUST be in lowercase with spaces between words
             - Names MUST NOT use technical formatting like camelCase, snake_case or PascalCase
             - Names MUST NOT contain underscores, hyphens, or special characters
             - Names should be clear, unambiguous and self-describing
-            - Names should not use acronyms or abbreviations unless they are universally understood
+            - Names should not use acronyms or abbreviations unless they are universally understood (e.g., URL, ID)
             - Names should be concise yet descriptive
             - Names should use standard terminology in the domain
             - Names should use business language that non-technical users can understand
@@ -69,6 +71,8 @@ class OptimizedDataEnhancementWorkflow:
             - Descriptions should be objective and factual, not opinion-based
             - Descriptions should use complete sentences with proper grammar and punctuation
             - Descriptions should be written in business language, not technical jargon
+            - Descriptions should start with a capital letter and end with a period
+            - Descriptions should avoid vague terms like "etc." or "and so on"
             
             Data Element to Evaluate and Enhance:
             - ID: {id}
@@ -77,24 +81,55 @@ class OptimizedDataEnhancementWorkflow:
             - Example (if provided): {example}
             {processes_info}
             
+            Here are examples of high-quality data elements that meet ISO/IEC 11179 standards:
+            
+            Example 1:
+            - Original Name: cust_id
+            - Enhanced Name: customer identifier
+            - Original Description: Customer ID in the system
+            - Enhanced Description: A unique alphanumeric code that identifies an individual customer within the organization's systems.
+            
+            Example 2:
+            - Original Name: LN
+            - Enhanced Name: last name
+            - Original Description: Last name
+            - Enhanced Description: The legal surname of an individual as it appears on official identification documents.
+            
+            Example 3:
+            - Original Name: trans_amt
+            - Enhanced Name: transaction amount
+            - Original Description: The $ amnt of the trans.
+            - Enhanced Description: The monetary value of a transaction expressed in the transaction's currency.
+            
+            Example 4:
+            - Original Name: emp_stat
+            - Enhanced Name: employment status
+            - Original Description: status of employee
+            - Enhanced Description: The current employment classification of an individual, indicating whether they are full-time, part-time, contracted, or on leave.
+            
             First, provide a VALIDATION of the current data element with:
-            1. Name valid: [yes/no]
-            2. Name feedback: [details]
-            3. Description valid: [yes/no]
-            4. Description feedback: [details]
-            5. Overall quality (GOOD, NEEDS_IMPROVEMENT, or POOR): [quality]
-            6. Improvements needed: [list]
+            1. Name valid: [yes/no] - Is the name fully compliant with ISO/IEC 11179 standards?
+            2. Name feedback: [detailed analysis of name quality]
+            3. Description valid: [yes/no] - Is the description fully compliant?
+            4. Description feedback: [detailed analysis of description quality]
+            5. Overall quality (GOOD, NEEDS_IMPROVEMENT, or POOR): [overall assessment]
+            6. Improvements needed: [specific issues that should be addressed]
             
             Then, provide an ENHANCEMENT of the data element with:
-            1. Enhanced Name: [improved name]
-            2. Enhanced Description: [improved description]
-            3. Enhancement Notes: [explanation]
-            4. Confidence Score (0.0-1.0): [score]
+            1. Enhanced Name: [provide the improved name in lowercase with spaces]
+            2. Enhanced Description: [provide the improved description with proper grammar and punctuation]
+            3. Enhancement Notes: [explain the specific changes made and how they improve compliance]
+            4. Confidence Score (0.0-1.0): [provide a confidence score for the enhancement]
             
             Your response MUST include both sections (VALIDATION and ENHANCEMENT).
+            Focus on creating names and descriptions that would get a "GOOD" quality assessment.
+            Expand all acronyms and abbreviations unless they are universally understood (like ID, URL).
             """
         )
         self.combined_chain = self.combined_prompt | self.llm | StrOutputParser()
+        
+        # Build the graph
+        self.graph = self._build_graph()
     
     def _convert_processes_to_model(self, processes_data):
         """Safely convert process data to Process objects if needed."""
@@ -138,7 +173,7 @@ class OptimizedDataEnhancementWorkflow:
     
     @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
     async def _single_call_enhancement(self, state: WorkflowState) -> WorkflowState:
-        """Perform validation and enhancement in a single LLM call to reduce latency."""
+        """Perform validation and enhancement in a single LLM call with improved quality."""
         try:
             # Handle processes correctly
             data_element_dict = state["data_element"].copy()
@@ -152,7 +187,7 @@ class OptimizedDataEnhancementWorkflow:
             # Format processes information
             processes_info = self._format_processes_info(original_element)
             
-            # Perform the combined validation and enhancement in a single call
+            # Run the combined validation and enhancement
             start_time = asyncio.get_event_loop().time()
             combined_result = await self.combined_chain.ainvoke({
                 "id": original_element.id,
@@ -165,8 +200,8 @@ class OptimizedDataEnhancementWorkflow:
             logger.info(f"Combined validation and enhancement completed in {elapsed:.2f}s")
             
             # Parse the validation and enhancement results
-            validation_result = self._parse_validation_section(combined_result)
-            enhancement_result = self._parse_enhancement_section(combined_result)
+            validation_result = self._parse_validation_result(combined_result)
+            enhancement_result = self._parse_enhancement_result(combined_result)
             
             # Update state with results
             state["validation_result"] = validation_result.dict()
@@ -188,7 +223,7 @@ class OptimizedDataEnhancementWorkflow:
                 "enhanced_description": enhancement_result.enhanced_description,
                 "processes": processes_dicts,
                 "quality_status": validation_result.quality_status,
-                "enhancement_iterations": 1,
+                "enhancement_iterations": state["iterations"] + 1,
                 "enhancement_feedback": [enhancement_result.feedback],
                 "validation_feedback": [validation_result.feedback],
                 "confidence_score": confidence_score
@@ -198,19 +233,19 @@ class OptimizedDataEnhancementWorkflow:
             # Increment iteration counter
             state["iterations"] = state["iterations"] + 1
             
-            # Check if we've achieved good quality
+            # Quick check if we've achieved good quality
             if validation_result.quality_status == DataQualityStatus.GOOD:
-                logger.info(f"Achieved GOOD quality on first attempt for element: {original_element.id}")
+                logger.info(f"Achieved GOOD quality on iteration {state['iterations']} for element: {original_element.id}")
                 state["is_complete"] = True
             
             return state
         except Exception as e:
-            logger.error(f"Error in combined validation/enhancement: {e}")
+            logger.error(f"Error in enhancement: {e}")
             state["error"] = f"Error in validation/enhancement: {str(e)}"
             state["is_complete"] = True
             return state
     
-    def _parse_validation_section(self, result: str) -> ValidationResult:
+    def _parse_validation_result(self, result: str) -> ValidationResult:
         """Parse the validation section of the combined result."""
         # Split by lines
         lines = result.split("\n")
@@ -254,10 +289,13 @@ class OptimizedDataEnhancementWorkflow:
         
         # Extract quality status
         quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
-        if "GOOD" in validation_text.upper():
-            quality_status = DataQualityStatus.GOOD
-        elif "POOR" in validation_text.upper():
-            quality_status = DataQualityStatus.POOR
+        for line in validation_text.split("\n"):
+            if "overall quality" in line.lower():
+                if "GOOD" in line.upper():
+                    quality_status = DataQualityStatus.GOOD
+                elif "POOR" in line.upper():
+                    quality_status = DataQualityStatus.POOR
+                break
         
         # Extract feedback
         feedback = "Name feedback: "
@@ -291,62 +329,80 @@ class OptimizedDataEnhancementWorkflow:
             suggested_improvements=improvements
         )
     
-    def _parse_enhancement_section(self, result: str) -> EnhancementResult:
+    def _parse_enhancement_result(self, result: str) -> EnhancementResult:
         """Parse the enhancement section of the combined result."""
         # Split by lines
-        lines = result.split("\n")
+        lines = result.strip().split("\n")
         
         # Find the enhancement section
         enhancement_start = None
-        
         for i, line in enumerate(lines):
             if "ENHANCEMENT" in line.upper():
                 enhancement_start = i
                 break
         
-        if enhancement_start is None:
-            return EnhancementResult(
-                enhanced_name="",
-                enhanced_description="",
-                feedback="Failed to parse enhancement results",
-                confidence=0.0
-            )
-        
-        enhancement_text = "\n".join(lines[enhancement_start:])
+        if enhancement_start is not None:
+            lines = lines[enhancement_start:]
         
         # Extract enhanced name
         enhanced_name = ""
-        name_match = re.search(r"Enhanced Name:(.+?)(?:\n\d+\.|\n\n|$)", enhancement_text, re.DOTALL)
-        if name_match:
-            enhanced_name = name_match.group(1).strip()
-            # Remove any enclosing brackets or quotes
-            enhanced_name = re.sub(r"^\[|\]$|^\"|\"\$", "", enhanced_name).strip()
+        for line in lines:
+            if "Enhanced Name:" in line:
+                enhanced_name = line.replace("Enhanced Name:", "").strip()
+                # Remove any enclosing brackets or quotes
+                enhanced_name = re.sub(r"^\[|\]$|^\"|\"\$", "", enhanced_name).strip()
+                break
         
         # Extract enhanced description
         enhanced_description = ""
-        desc_match = re.search(r"Enhanced Description:(.+?)(?:\n\d+\.|\n\n|Enhancement Notes:|$)", enhancement_text, re.DOTALL)
-        if desc_match:
-            enhanced_description = desc_match.group(1).strip()
+        description_lines = []
+        description_mode = False
+        
+        for line in lines:
+            if "Enhanced Description:" in line:
+                description_mode = True
+                description_lines.append(line.replace("Enhanced Description:", "").strip())
+            elif description_mode and ("Enhancement Notes:" in line or "Confidence Score" in line):
+                description_mode = False
+            elif description_mode:
+                description_lines.append(line.strip())
+        
+        if description_lines:
+            enhanced_description = " ".join(description_lines)
             # Remove any enclosing brackets or quotes
             enhanced_description = re.sub(r"^\[|\]$|^\"|\"\$", "", enhanced_description).strip()
         
         # Extract feedback
         feedback = ""
-        feedback_match = re.search(r"Enhancement Notes:(.+?)(?:\n\d+\.|\n\n|Confidence Score|$)", enhancement_text, re.DOTALL)
-        if feedback_match:
-            feedback = feedback_match.group(1).strip()
+        feedback_lines = []
+        feedback_mode = False
+        
+        for line in lines:
+            if "Enhancement Notes:" in line:
+                feedback_mode = True
+                feedback_lines.append(line.replace("Enhancement Notes:", "").strip())
+            elif feedback_mode and "Confidence Score" in line:
+                feedback_mode = False
+            elif feedback_mode:
+                feedback_lines.append(line.strip())
+        
+        if feedback_lines:
+            feedback = " ".join(feedback_lines)
             # Remove any enclosing brackets or quotes
             feedback = re.sub(r"^\[|\]$|^\"|\"\$", "", feedback).strip()
         
         # Extract confidence
         confidence = 0.7  # Default
-        confidence_match = re.search(r"Confidence Score.+?(\d+\.\d+)", enhancement_text)
-        if confidence_match:
-            try:
-                confidence = float(confidence_match.group(1))
-                confidence = max(0.0, min(1.0, confidence))  # Ensure within bounds
-            except ValueError:
-                pass
+        for line in lines:
+            if "Confidence Score" in line:
+                confidence_match = re.search(r"(\d+\.\d+)", line)
+                if confidence_match:
+                    try:
+                        confidence = float(confidence_match.group(1))
+                        confidence = max(0.0, min(1.0, confidence))  # Ensure within bounds
+                    except ValueError:
+                        pass
+                break
         
         return EnhancementResult(
             enhanced_name=enhanced_name,
@@ -363,14 +419,22 @@ class OptimizedDataEnhancementWorkflow:
             return "complete"
         
         # Check if we've achieved good quality
-        quality_status = state.get("validation_result", {}).get("quality_status")
+        quality_status = None
+        if state.get("validation_result") is not None:
+            quality_status = state["validation_result"].get("quality_status")
+        
         if quality_status == DataQualityStatus.GOOD:
             logger.info("Quality status is GOOD, completing workflow")
             return "complete"
         
         # If we have enhanced data, check its quality status
-        if state.get("enhanced_data") and state["enhanced_data"].get("quality_status") == DataQualityStatus.GOOD:
+        if state.get("enhanced_data") is not None and state["enhanced_data"].get("quality_status") == DataQualityStatus.GOOD:
             logger.info("Enhanced data quality status is GOOD, completing workflow")
+            return "complete"
+        
+        # Check for error conditions
+        if state.get("error"):
+            logger.error(f"Error detected: {state['error']}, completing workflow")
             return "complete"
         
         # Continue the process only if quality is not good and we haven't reached max iterations
@@ -383,7 +447,7 @@ class OptimizedDataEnhancementWorkflow:
         logger.info("Workflow completed")
         
         # Add a final confidence evaluation if needed
-        if state.get("enhanced_data") and state["enhanced_data"]["quality_status"] == DataQualityStatus.GOOD:
+        if state.get("enhanced_data") is not None and state["enhanced_data"].get("quality_status") == DataQualityStatus.GOOD:
             logger.info("Enhancement achieved GOOD quality - setting high confidence")
             state["enhanced_data"]["confidence_score"] = 1.0
         
@@ -422,7 +486,7 @@ class OptimizedDataEnhancementWorkflow:
         
         Args:
             data_element: The data element to enhance
-            max_iterations: Maximum number of enhancement iterations to perform (default reduced to 2)
+            max_iterations: Maximum number of enhancement iterations to perform
         
         Returns:
             Enhanced data element
@@ -455,13 +519,22 @@ class OptimizedDataEnhancementWorkflow:
         if not result.get("enhanced_data"):
             logger.info("No enhancement was performed, using original data")
             # If no enhancement was performed, create an enhanced data element from the original
+            validation_feedback = []
+            if result.get("validation_result") and result["validation_result"].get("feedback"):
+                validation_feedback = [result["validation_result"]["feedback"]]
+                
+            quality_status = DataQualityStatus.GOOD
+            if result.get("validation_result") and result["validation_result"].get("quality_status"):
+                quality_status = result["validation_result"]["quality_status"]
+            
             return EnhancedDataElement(
                 **data_element.dict(),
                 enhanced_name=data_element.existing_name,
                 enhanced_description=data_element.existing_description,
-                quality_status=result["validation_result"]["quality_status"] if result.get("validation_result") else DataQualityStatus.GOOD,
+                quality_status=quality_status,
                 enhancement_iterations=0,
-                validation_feedback=[result["validation_result"]["feedback"]] if result.get("validation_result") else [],
+                validation_feedback=validation_feedback,
+                enhancement_feedback=[],
                 confidence_score=0.5  # Default confidence
             )
         
@@ -476,7 +549,6 @@ class OptimizedDataEnhancementWorkflow:
     async def stream_run(self, data_element: DataElement, max_iterations: int = 2) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Run the workflow and stream results after each iteration.
-        Max iterations reduced to 2 for better performance.
         """
         # Convert processes to dict for serializing in the state
         element_dict = data_element.dict()
@@ -518,20 +590,31 @@ class OptimizedDataEnhancementWorkflow:
                 }
                 return
             
-            # Send first iteration results
-            progress = min(1.0, state["iterations"] / max_iterations)
-            yield {
-                "status": "in_progress",
-                "message": f"Completed iteration {state['iterations']}",
-                "iteration": state["iterations"],
-                "progress": progress,
-                "current_result": {
-                    "enhanced_name": state["enhanced_data"]["enhanced_name"],
-                    "enhanced_description": state["enhanced_data"]["enhanced_description"],
-                    "quality_status": state["enhanced_data"]["quality_status"],
-                    "confidence_score": state["enhanced_data"]["confidence_score"]
+            # Check if enhanced_data exists before trying to access it
+            if state.get("enhanced_data"):
+                # Send first iteration results
+                progress = min(1.0, state["iterations"] / max_iterations)
+                yield {
+                    "status": "in_progress",
+                    "message": f"Completed iteration {state['iterations']}",
+                    "iteration": state["iterations"],
+                    "progress": progress,
+                    "current_result": {
+                        "enhanced_name": state["enhanced_data"]["enhanced_name"],
+                        "enhanced_description": state["enhanced_data"]["enhanced_description"],
+                        "quality_status": state["enhanced_data"]["quality_status"],
+                        "confidence_score": state["enhanced_data"]["confidence_score"]
+                    }
                 }
-            }
+            else:
+                # Handle case where enhanced_data is None
+                yield {
+                    "status": "error",
+                    "message": "Failed to generate enhanced data",
+                    "iteration": state["iterations"],
+                    "progress": 0.0
+                }
+                return
             
             # Continue iterations until complete or hit limit
             while not state["is_complete"] and state["iterations"] < max_iterations:
@@ -547,44 +630,65 @@ class OptimizedDataEnhancementWorkflow:
                         "status": "error",
                         "message": state["error"],
                         "iteration": state["iterations"],
-                        "progress": progress
+                        "progress": 0.0
                     }
                     return
                 
-                # Send iteration results
-                progress = min(1.0, state["iterations"] / max_iterations)
-                yield {
-                    "status": "in_progress",
-                    "message": f"Completed iteration {state['iterations']}",
-                    "iteration": state["iterations"],
-                    "progress": progress,
-                    "current_result": {
-                        "enhanced_name": state["enhanced_data"]["enhanced_name"],
-                        "enhanced_description": state["enhanced_data"]["enhanced_description"],
-                        "quality_status": state["enhanced_data"]["quality_status"],
-                        "confidence_score": state["enhanced_data"]["confidence_score"]
+                # Check if enhanced_data exists before trying to access it
+                if state.get("enhanced_data"):
+                    # Send iteration results
+                    progress = min(1.0, state["iterations"] / max_iterations)
+                    yield {
+                        "status": "in_progress",
+                        "message": f"Completed iteration {state['iterations']}",
+                        "iteration": state["iterations"],
+                        "progress": progress,
+                        "current_result": {
+                            "enhanced_name": state["enhanced_data"]["enhanced_name"],
+                            "enhanced_description": state["enhanced_data"]["enhanced_description"],
+                            "quality_status": state["enhanced_data"]["quality_status"],
+                            "confidence_score": state["enhanced_data"]["confidence_score"]
+                        }
                     }
-                }
+                else:
+                    # Handle case where enhanced_data is None
+                    yield {
+                        "status": "error",
+                        "message": "Failed to generate enhanced data",
+                        "iteration": state["iterations"],
+                        "progress": 0.0
+                    }
+                    return
             
             # Complete the workflow if not already
             if not state["is_complete"]:
                 state = await self._complete_workflow(state)
             
-            # Handle the processes correctly
-            if state["enhanced_data"].get("processes"):
+            # Handle the processes correctly if enhanced_data exists
+            if state.get("enhanced_data") and state["enhanced_data"].get("processes"):
                 state["enhanced_data"]["processes"] = self._convert_processes_to_model(state["enhanced_data"]["processes"])
             
-            # Convert to EnhancedDataElement
-            enhanced_element = EnhancedDataElement(**state["enhanced_data"])
-            
-            # Send final result
-            yield {
-                "status": "completed",
-                "message": "Enhancement workflow completed",
-                "iteration": state["iterations"],
-                "progress": 1.0,
-                "result": enhanced_element.dict()
-            }
+            # Only convert to EnhancedDataElement if enhanced_data exists
+            if state.get("enhanced_data"):
+                # Convert to EnhancedDataElement
+                enhanced_element = EnhancedDataElement(**state["enhanced_data"])
+                
+                # Send final result
+                yield {
+                    "status": "completed",
+                    "message": "Enhancement workflow completed",
+                    "iteration": state["iterations"],
+                    "progress": 1.0,
+                    "result": enhanced_element.dict()
+                }
+            else:
+                # Handle case where enhanced_data is None
+                yield {
+                    "status": "error",
+                    "message": "Failed to generate enhanced data",
+                    "iteration": state["iterations"],
+                    "progress": 0.0
+                }
             
         except Exception as e:
             logger.error(f"Error in streaming workflow: {e}")
@@ -592,7 +696,7 @@ class OptimizedDataEnhancementWorkflow:
                 "status": "error",
                 "message": f"Error: {str(e)}",
                 "iteration": state.get("iterations", 0),
-                "progress": min(1.0, state.get("iterations", 0) / max_iterations)
+                "progress": 0.0
             }
 
 # For backwards compatibility

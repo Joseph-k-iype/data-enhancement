@@ -2,15 +2,42 @@
 Application settings for the Data Enhancement Service.
 """
 
+# import os
+# import logging
+# from typing import Optional, Union, Dict, Any, List, Set
+# from pydantic import BaseModel, Field, validator
+# import langchain
+# from langchain.cache import InMemoryCache
+# from app.config.environment import get_os_env
+# from langchain_openai import AzureChatOpenAI
+# from app.utils.auth_helper import get_azure_token
+
+"""
+Update the LangChain caching configuration in app/config/settings.py
+"""
+
+# Update this section at the top of settings.py
 import os
 import logging
-from typing import Optional, Union, Dict, Any, List, Set
-from pydantic import BaseModel, Field, validator
-import langchain
-from langchain.cache import InMemoryCache
+import threading
+from typing import Optional, Dict, Any, Set, Tuple
+from pydantic import BaseModel, Field, validator, model_validator
+
+# Update these imports for modern LangChain
+from langchain_core.caches import BaseCache, InMemoryCache  # Updated import path
+import langchain_core as langchain  # Updated namespace
+
 from app.config.environment import get_os_env
 from langchain_openai import AzureChatOpenAI
 from app.utils.auth_helper import get_azure_token
+
+logger = logging.getLogger(__name__)
+
+# Initialize LangChain cache for token savings
+langchain.globals.set_llm_cache(InMemoryCache())  # Updated method for setting cache
+
+# Rest of the settings.py file remains the same
+
 
 logger = logging.getLogger(__name__)
 

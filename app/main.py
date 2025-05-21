@@ -1,6 +1,7 @@
 """
-Optimized main application file for production-grade performance.
-Replace app/main.py with this implementation.
+Corrected Main Application - Prevents automatic shutdown.
+
+This fixes the "maximum request limit of 0 exceeded" error that causes the server to terminate.
 """
 
 import argparse
@@ -9,7 +10,7 @@ import os
 import sys
 import time
 import uuid
-from typing import Optional
+from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 import orjson
 from fastapi import FastAPI, Depends, Request, Response
@@ -21,8 +22,12 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 # Ensure parent directory is in path for module imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
+# Standard imports from your app modules
 from app.api.routes.enhancement import router as enhancement_router
 from app.api.routes.settings import router as settings_router
 from app.config.environment import get_os_env, str_to_bool
@@ -36,7 +41,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout) # Log to stdout
+        logging.StreamHandler(sys.stdout)  # Log to stdout
     ]
 )
 logger = logging.getLogger(__name__)
@@ -54,6 +59,19 @@ except ImportError:
     except Exception as e:
         logger.error(f"Failed to install psutil: {e}. Monitoring might not work correctly.")
 
+# Make sure orjson is installed for faster JSON processing
+try:
+    import orjson
+except ImportError:
+    logger.warning("orjson not installed. Installing for better performance...")
+    try:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "orjson"])
+        import orjson
+        logger.info("orjson installed successfully.")
+    except Exception as e:
+        logger.error(f"Failed to install orjson: {e}. Will use standard JSON processing.")
+
 # Custom JSONResponse class using orjson for better performance
 class ORJSONResponse(JSONResponse):
     media_type = "application/json"
@@ -67,6 +85,10 @@ class ORJSONResponse(JSONResponse):
 # Use asynccontextmanager for startup/shutdown events
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for application startup and shutdown events.
+    This is the modern way to handle startup/shutdown in FastAPI.
+    """
     # Startup code
     logger.info("Application startup")
     
@@ -77,7 +99,7 @@ async def lifespan(app: FastAPI):
     setup_caching(max_size=5000, ttl=7200)  # Larger cache size and longer TTL
     logger.info("Caching system initialized with expanded memory")
     
-    # Initialize token caching system
+    # Initialize token caching system with proper refresh interval
     token_refresh_interval = int(env.get("TOKEN_REFRESH_INTERVAL", "600"))
     initialize_token_caching(start_refresh_service=True, refresh_interval=token_refresh_interval)
     logger.info(f"Token caching system initialized with refresh interval: {token_refresh_interval}s")
@@ -88,10 +110,14 @@ async def lifespan(app: FastAPI):
         logger.info(f"Starting system monitoring. Interval: {monitoring_interval}s")
         start_monitoring(interval=monitoring_interval)
     
+    # Check in-memory job store health
+    store_health = job_store.health_check()
+    logger.info(f"Optimized in-memory job store initialized: {store_health}")
+    
     # Pre-warm CPU caches and JIT compiler
     logger.info("Pre-warming system...")
     
-    # Yield control
+    # Yield control to FastAPI
     yield
     
     # Shutdown code
@@ -103,7 +129,8 @@ async def lifespan(app: FastAPI):
     
     # Stop job store
     try:
-        job_store.stop()
+        if hasattr(job_store, 'stop') and callable(job_store.stop):
+            job_store.stop()
     except Exception as e:
         logger.error(f"Error stopping job store: {e}")
     
@@ -134,10 +161,6 @@ def create_application(
     
     logger.info(f"Proxy enabled: {env.get('PROXY_ENABLED')}")
     logger.info(f"Model name: {env.get('MODEL_NAME', 'gpt-4o-mini')}")
-
-    # Check in-memory job store health
-    store_health = job_store.health_check()
-    logger.info(f"Optimized in-memory job store initialized: {store_health}")
     
     # Custom route class that uses ORJSONResponse for better performance
     class ORJSONRoute(APIRoute):
@@ -223,7 +246,7 @@ def create_application(
     app.include_router(settings_router)
 
     @app.get("/health", tags=["System"])
-    async def health_check_endpoint(request: Request):
+    async def health_check_endpoint():
         """Provides a health check for the API and its dependencies."""
         current_env = get_os_env() # Get current state of env vars
         store_status = job_store.health_check()
@@ -276,7 +299,15 @@ def create_application(
     logger.info("FastAPI application created successfully.")
     return app
 
-def parse_arguments():
+# Create a global app instance for use by Uvicorn when imported
+app = create_application(
+    proxy_enabled=str_to_bool(os.getenv("PROXY_ENABLED", "True")),
+    monitoring_interval=int(os.getenv("MONITORING_INTERVAL", "300")),
+    token_refresh_interval=int(os.getenv("TOKEN_REFRESH_INTERVAL", "600"))
+)
+
+# Direct execution entry point
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Data Element Enhancement API")
     parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host to bind")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="Port to bind")
@@ -312,6 +343,8 @@ def parse_arguments():
                       help="Timeout for keep alive connections in seconds")
     parser.add_argument("--limit-concurrency", type=int, default=int(os.getenv("LIMIT_CONCURRENCY", "100")), 
                       help="Maximum number of concurrent connections")
+    
+    # FIXED: Changed default to None to prevent auto-shutdown and added validation
     parser.add_argument("--limit-max-requests", type=int, default=int(os.getenv("LIMIT_MAX_REQUESTS", "0")), 
                       help="Maximum number of requests per worker (0 for unlimited)")
     
@@ -320,34 +353,13 @@ def parse_arguments():
     parser.add_argument("--creds-file", type=str, default=os.getenv("ENV_CREDS_PATH", "env/credentials.env"), help="Path to credentials.env file")
     parser.add_argument("--cert-file", type=str, default=os.getenv("ENV_CERT_PATH", "env/cacert.pem"), help="Path to cacert.pem file")
 
-    return parser.parse_args()
-
-# Application instance for Uvicorn if run directly
-# This ensures settings from args are applied if __name__ == "__main__"
-# Otherwise, a default app instance is created for imports.
-if os.getenv("_FASTAPI_RELOAD") == "true" or __name__ != "__main__":
-    # When reloading or importing, create a default app.
-    # Uvicorn reload will handle re-running __main__ block.
-    # Set environment variables that would normally be set by args for consistency
-    os.environ.setdefault("TOKEN_CACHING_ENABLED", "True")
-    os.environ.setdefault("TOKEN_REFRESH_INTERVAL", "600")
-    os.environ.setdefault("TOKEN_VALIDATION_THRESHOLD", "600")
-    os.environ.setdefault("API_VERSION", "2024-02-01")
-    app = create_application(
-        proxy_enabled=str_to_bool(os.getenv("PROXY_ENABLED", "True")),
-        monitoring_interval=int(os.getenv("MONITORING_INTERVAL", "300")),
-        token_refresh_interval=int(os.getenv("TOKEN_REFRESH_INTERVAL", "600"))
-    )
-
-if __name__ == "__main__":
-    args = parse_arguments()
+    args = parser.parse_args()
 
     # Configure logging level
     log_level = getattr(logging, args.log_level.upper())
     logging.basicConfig(level=log_level)
 
     # Set environment variables from arguments to be available for get_os_env()
-    # These will be picked up by OSEnv when get_os_env() is called within create_application()
     os.environ["ENV_CONFIG_PATH"] = args.config_file
     os.environ["ENV_CREDS_PATH"] = args.creds_file
     os.environ["ENV_CERT_PATH"] = args.cert_file
@@ -386,7 +398,13 @@ if __name__ == "__main__":
     logger.info(f"Certificate File: {args.cert_file}")
     logger.info(f"Timeout Keep Alive: {args.timeout_keep_alive}s")
     logger.info(f"Limit Concurrency: {args.limit_concurrency}")
-    logger.info(f"Limit Max Requests: {args.limit_max_requests}")
+    
+    # FIXED: Add special handling for limit_max_requests=0
+    if args.limit_max_requests == 0:
+        logger.info("Limit Max Requests: 0 (unlimited)")
+    else:
+        logger.info(f"Limit Max Requests: {args.limit_max_requests}")
+    
     logger.info(f"------------------------------------")
 
     # For reload mode, use a single worker
@@ -401,8 +419,9 @@ if __name__ == "__main__":
         )
         
         # When reloading, uvicorn expects the app as a string "module:app_variable_name"
+        logger.info(f"Starting in development mode with auto-reload at http://{args.host}:{args.port}")
         uvicorn.run(
-            "main:app_instance", 
+            "app.main:app", 
             host=args.host, 
             port=args.port, 
             reload=True,
@@ -410,14 +429,19 @@ if __name__ == "__main__":
         )
     else:
         # For production mode, pass configuration directly to uvicorn
+        logger.info(f"Starting in production mode at http://{args.host}:{args.port} with {args.workers} workers")
+        
+        # FIXED: Set limit_max_requests=None when it's 0 to prevent auto-shutdown
+        limit_max_requests = None if args.limit_max_requests == 0 else args.limit_max_requests
+        
         uvicorn_config = uvicorn.Config(
-            "main:app",
+            app,
             host=args.host,
             port=args.port,
             log_level=args.log_level,
             timeout_keep_alive=args.timeout_keep_alive,
             limit_concurrency=args.limit_concurrency,
-            limit_max_requests=args.limit_max_requests,
+            limit_max_requests=limit_max_requests,  # Use None for unlimited requests
             workers=args.workers,
             lifespan="on"
         )

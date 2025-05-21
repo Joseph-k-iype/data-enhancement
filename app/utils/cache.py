@@ -1,7 +1,5 @@
 """
-Enhanced caching strategy for app/utils/cache.py
-This implementation provides more efficient caching with TTL management
-and result serialization for better performance.
+Updated cache.py with fixed async methods for the CacheManager class.
 """
 
 import functools
@@ -11,6 +9,7 @@ import logging
 import time
 import pickle
 import threading
+import asyncio
 from typing import Any, Callable, Dict, Optional, TypeVar, cast, List, Set, Tuple
 from datetime import datetime, timedelta
 
@@ -27,6 +26,7 @@ class CacheManager:
     - TTL management with background cleanup
     - Thread-safe operations
     - Detailed statistics and monitoring
+    - Async support
     """
     
     _instance = None
@@ -64,6 +64,9 @@ class CacheManager:
             "size": 0
         }
         
+        # Jobs cache for storing job-like objects
+        self._jobs_cache: Dict[str, Dict[str, Any]] = {}
+        
         # Last access timestamps for LRU eviction
         self._last_access = {}
         
@@ -94,7 +97,7 @@ class CacheManager:
         expired_keys = []
         
         with self._lock:
-            # Find expired keys
+            # Find expired keys in main cache
             for key, entry in self._cache.items():
                 if now > entry.get("expires_at", 0):
                     expired_keys.append(key)
@@ -108,6 +111,15 @@ class CacheManager:
             # Update stats
             self._stats["expired"] += len(expired_keys)
             self._stats["size"] = len(self._cache)
+            
+            # Also clean up jobs cache
+            expired_jobs = []
+            for key, job in self._jobs_cache.items():
+                if "expires_at" in job and now > job["expires_at"]:
+                    expired_jobs.append(key)
+                    
+            for key in expired_jobs:
+                del self._jobs_cache[key]
         
         if expired_keys:
             logger.debug(f"Removed {len(expired_keys)} expired cache entries")
@@ -279,6 +291,7 @@ class CacheManager:
         with self._lock:
             self._cache.clear()
             self._last_access.clear()
+            self._jobs_cache.clear()
             self._stats["size"] = 0
         logger.info("Cache cleared")
     
@@ -305,7 +318,8 @@ class CacheManager:
                 "evictions": self._stats["evictions"],
                 "additions": self._stats["additions"],
                 "expired": self._stats["expired"],
-                "memory_usage_estimate": self._estimate_memory_usage()
+                "memory_usage_estimate": self._estimate_memory_usage(),
+                "jobs_cache_size": len(self._jobs_cache)
             }
     
     def _estimate_memory_usage(self) -> int:
@@ -413,6 +427,111 @@ class CacheManager:
                 return result
             return cast(Callable[..., T], wrapper)
         return decorator
+    
+    # New methods for job-like caching
+    def store_job(self, job_id: str, job_type: str, status: str, data: Dict[str, Any], ttl: Optional[int] = None) -> bool:
+        """
+        Store a job in the cache.
+        
+        Args:
+            job_id: Unique identifier for the job
+            job_type: Type of job
+            status: Status of the job
+            data: Job data
+            ttl: Optional TTL override
+            
+        Returns:
+            bool: True if successful
+        """
+        with self._lock:
+            expires_at = time.time() + (ttl or self._default_ttl)
+            self._jobs_cache[job_id] = {
+                "id": job_id,
+                "job_type": job_type,
+                "status": status,
+                "data": data,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "expires_at": expires_at
+            }
+            return True
+    
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a job from the cache.
+        
+        Args:
+            job_id: Job ID
+            
+        Returns:
+            Dict: Job data or None if not found
+        """
+        with self._lock:
+            job = self._jobs_cache.get(job_id)
+            if job:
+                # Check if job is expired
+                if time.time() > job.get("expires_at", float('inf')):
+                    del self._jobs_cache[job_id]
+                    return None
+                return job.copy()
+            return None
+    
+    def delete_job(self, job_id: str) -> bool:
+        """
+        Delete a job from the cache.
+        
+        Args:
+            job_id: Job ID
+            
+        Returns:
+            bool: True if found and deleted, False otherwise
+        """
+        with self._lock:
+            if job_id in self._jobs_cache:
+                del self._jobs_cache[job_id]
+                return True
+            return False
+    
+    # Async versions
+    async def async_get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Asynchronously get a job from the cache.
+        
+        Args:
+            job_id: Job ID
+            
+        Returns:
+            Dict: Job data or None if not found
+        """
+        return self.get_job(job_id)
+    
+    async def async_store_job(self, job_id: str, job_type: str, status: str, data: Dict[str, Any], ttl: Optional[int] = None) -> bool:
+        """
+        Asynchronously store a job in the cache.
+        
+        Args:
+            job_id: Unique identifier for the job
+            job_type: Type of job
+            status: Status of the job
+            data: Job data
+            ttl: Optional TTL override
+            
+        Returns:
+            bool: True if successful
+        """
+        return self.store_job(job_id, job_type, status, data, ttl)
+    
+    async def async_delete_job(self, job_id: str) -> bool:
+        """
+        Asynchronously delete a job from the cache.
+        
+        Args:
+            job_id: Job ID
+            
+        Returns:
+            bool: True if found and deleted, False otherwise
+        """
+        return self.delete_job(job_id)
     
     def stop(self):
         """Stop the cache manager and cleanup thread."""
